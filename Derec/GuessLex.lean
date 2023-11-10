@@ -9,39 +9,6 @@ open Lean Meta Elab WF
 
 namespace Derec
 
-private partial def addNonRecPreDefs (preDefs : Array PreDefinition) (preDefNonRec : PreDefinition) (fixedPrefixSize : Nat) : TermElabM Unit := do
-  let us := preDefNonRec.levelParams.map mkLevelParam
-  let all := preDefs.toList.map (·.declName)
-  for fidx in [:preDefs.size] do
-    let preDef := preDefs[fidx]!
-    let value ← lambdaTelescope preDef.value fun xs _ => do
-      let packedArgs : Array Expr := xs[fixedPrefixSize:]
-      let mkProd (type : Expr) : MetaM Expr := do
-        mkUnaryArg type packedArgs
-      let rec mkSum (i : Nat) (type : Expr) : MetaM Expr := do
-        if i == preDefs.size - 1 then
-          mkProd type
-        else
-          (← whnfD type).withApp fun f args => do
-            assert! args.size == 2
-            if i == fidx then
-              return mkApp3 (mkConst ``PSum.inl f.constLevels!) args[0]! args[1]! (← mkProd args[0]!)
-            else
-              let r ← mkSum (i+1) args[1]!
-              return mkApp3 (mkConst ``PSum.inr f.constLevels!) args[0]! args[1]! r
-      let Expr.forallE _ domain _ _ := (← instantiateForall preDefNonRec.type xs[:fixedPrefixSize]) | unreachable!
-      let arg ← mkSum 0 domain
-      mkLambdaFVars xs (mkApp (mkAppN (mkConst preDefNonRec.declName us) xs[:fixedPrefixSize]) arg)
-    trace[Elab.definition.wf] "{preDef.declName} := {value}"
-    addNonRec { preDef with value } (applyAttrAfterCompilation := false) (all := all)
-
-
-private def isOnlyOneUnaryDef (preDefs : Array PreDefinition) (fixedPrefixSize : Nat) : MetaM Bool := do
-  if preDefs.size == 1 then
-    lambdaTelescope preDefs[0]!.value fun xs _ => return xs.size == fixedPrefixSize + 1
-  else
-    return false
-
 def naryVarNames (preDef : PreDefinition) : TermElabM (Array Name):= do
   -- TODO: Pretty names when no user name is available?
   lambdaTelescope preDef.value fun xs _ => do
@@ -190,8 +157,6 @@ where
           (Array.zip matcherApp.alts altScruts).forM fun (alt, altScrut) =>
             lambdaTelescope alt fun xs altBody => do
               loop (altScrut.instantiateRev xs) altBody
-        -- else
-        -- processApp scrut e
       | none =>
       match (← toCasesOnApp? e) with
       | some casesOnApp =>
@@ -202,8 +167,6 @@ where
           (Array.zip casesOnApp.alts altScruts).forM fun (alt, altScrut) =>
             lambdaTelescope alt fun xs altBody => do
               loop (altScrut.instantiateRev xs) altBody
-        -- else
-          -- processApp scrut e
       | none => processApp scrut e
     | e => do
       let _ ← ensureNoRecFn recFnName e
@@ -219,7 +182,7 @@ private partial def withUnary {α} (preDef : PreDefinition) (prefixSize : Nat) (
       mvarId ← mvarId.rename localDecl.fvarId varName
   let numPackedArgs := varNames.size - prefixSize
   let rec go (i : Nat) (mvarId : MVarId) (fvarId : FVarId) (fvarIds : Array FVarId) : TermElabM α := do
-    trace[Elab.definition.wf] "i: {i}, varNames: {varNames}, goal: {mvarId}"
+    trace[Elab.definition.wf] "withUnary: i: {i}, varNames: {varNames}, goal: {mvarId}"
     if i < numPackedArgs - 1 then
       let #[s] ← mvarId.cases fvarId #[{ varNames := [varNames[prefixSize + i]!] }] | unreachable!
       go (i+1) s.mvarId s.fields[1]!.fvarId! (fvarIds.push s.fields[0]!.fvarId!)
@@ -227,6 +190,37 @@ private partial def withUnary {α} (preDef : PreDefinition) (prefixSize : Nat) (
       let mvarId ← mvarId.rename fvarId varNames.back
       k mvarId (fvarIds.push fvarId)
   go 0 mvarId fvarId #[]
+
+/-- A `RecCallContext` focuses on a single recursive call in a unary predefinition,
+and runs the given action in the context of that call. The arguments are
+the function's unary argument, refined by case analysis, and the recursive call'
+unary argument.
+-/
+structure RecCallContext where
+  param : Expr
+  arg : Expr
+  savedState : Term.SavedState
+
+
+/-- Traverse a unary PreDefinition, and returns a `WithRecCall` closure for each recursive
+call site.
+-/
+def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat) :
+    TermElabM (Array RecCallContext) := withoutModifyingState do
+  lambdaTelescope unaryPreDef.value fun xs body => do
+    trace[Elab.definition.wf] "lexGuessCol: {xs} {body}"
+    -- assert xs.size  == fixedPrefixSize + 1
+    let param := xs[fixedPrefixSize]!
+    withRecApps unaryPreDef.declName fixedPrefixSize body param fun param args => do
+      let arg := args[0]!
+      let savedState ← saveState
+      return { param, arg, savedState }
+
+def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
+    TermElabM α := withoutModifyingState $ do
+  restoreState rcc.savedState
+  k rcc.param rcc.arg
+
 
 inductive GuessLexRel | lt | le | gt
 deriving Repr
@@ -241,16 +235,12 @@ def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPre
     (varNames : Array Name) (varIdx : Nat) : TermElabM (Array (Option GuessLexRel)):= do
   let varNames ← lambdaTelescope preDef.value fun xs _ => do
     xs.mapM fun x => x.fvarId!.getUserName
-  trace[Elab.definition.wf] "lexGuessCol: {unaryPreDef.value}"
-  lambdaTelescope unaryPreDef.value fun xs body => do
-    trace[Elab.definition.wf] "lexGuessCol: {xs} {body}"
-    -- assert xs.size  == fixedPrefixSize + 1
-    let x := xs[fixedPrefixSize]!
-    -- is there a better way to get `x`?
-    withRecApps unaryPreDef.declName fixedPrefixSize body x fun x args => do
-      trace[Elab.definition.wf] "Rec arg: {args}"
-      withLetDecl (← mkFreshUserName `packed_x) packedArgType x fun x => do
-      withLetDecl (← mkFreshUserName `packed_arg) packedArgType args[0]! fun arg => do
+
+  let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
+  recCalls.mapM fun rcc => rcc.run fun packed_param packed_arg => do
+      trace[Elab.definition.wf] "rcc.run: {packed_param} {packed_arg}"
+      withLetDecl (← mkFreshUserName `packed_param) packedArgType packed_param fun x => do
+      withLetDecl (← mkFreshUserName `packed_arg) packedArgType packed_arg fun arg => do
         for rel in [GuessLexRel.lt, .le, .gt] do
           let goalMVar ← mkFreshExprSyntheticOpaqueMVar (.sort levelZero)
           let goalMVarId := goalMVar.mvarId!
@@ -262,6 +252,8 @@ def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPre
           withUnary preDef fixedPrefixSize packedParamMVarId x.fvarId! fun paramMVarId fvarIds =>
             paramMVarId.assign (mkFVar fvarIds[varIdx]!)
           let goalExpr ← instantiateMVars goalMVar
+
+          trace[Elab.definition.wf] "Goal (uncecked): {goalExpr}"
           check goalExpr
 
           let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
@@ -327,7 +319,6 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     let type ← whnfForall type
     let packedArgType := type.bindingDomain!
     -- Maybe do this before packMutual?
-    trace[Elab.definition.wf] "guessing at: {unaryPreDef.value}"
     trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
     let varNames ← naryVarNames preDefs[0]!
     trace[Elab.definition.wf] "varNames is: {varNames}"
@@ -337,9 +328,9 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     logInfo (prettyLexMatrix varNames cols)
 
 
--- set_option trace.Elab.definition.wf true
--- set_option pp.inaccessibleNames true
--- set_option pp.auxDecls true
+set_option trace.Elab.definition.wf true
+set_option pp.inaccessibleNames true
+set_option pp.auxDecls true
 
 def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
   | .succ n, 0 => foo2 n 0
