@@ -2,6 +2,7 @@ import Lean.Elab.PreDefinition.Main
 
 
 
+
 set_option autoImplicit false
 set_option linter.unusedVariables false
 
@@ -200,26 +201,37 @@ structure RecCallContext where
   param : Expr
   arg : Expr
   savedState : Term.SavedState
+  savedMetaContext : Meta.Context
+  savedTermContext : Term.Context
 
+def RecCallContext.create (param arg : Expr) : TermElabM RecCallContext := do
+  let savedState ← saveState
+  let savedMetaContext ← readThe Meta.Context
+  let savedTermContext ← readThe Term.Context
+  return { param, arg, savedState, savedMetaContext, savedTermContext }
+
+
+def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
+    TermElabM α := withoutModifyingState $ do
+  restoreState rcc.savedState
+  withTheReader Meta.Context (fun _ => rcc.savedMetaContext) do
+  withTheReader Term.Context (fun _ => rcc.savedTermContext) do
+  k rcc.param rcc.arg
 
 /-- Traverse a unary PreDefinition, and returns a `WithRecCall` closure for each recursive
 call site.
 -/
-def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat) :
-    TermElabM (Array RecCallContext) := withoutModifyingState do
+def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
+    -- (k : Expr → Expr → TermElabM α) : TermElabM (Array α)
+    : TermElabM (Array RecCallContext)
+    := withoutModifyingState do
   lambdaTelescope unaryPreDef.value fun xs body => do
     trace[Elab.definition.wf] "lexGuessCol: {xs} {body}"
     -- assert xs.size  == fixedPrefixSize + 1
     let param := xs[fixedPrefixSize]!
     withRecApps unaryPreDef.declName fixedPrefixSize body param fun param args => do
       let arg := args[0]!
-      let savedState ← saveState
-      return { param, arg, savedState }
-
-def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
-    TermElabM α := withoutModifyingState $ do
-  restoreState rcc.savedState
-  k rcc.param rcc.arg
+      RecCallContext.create param arg
 
 
 inductive GuessLexRel | lt | le | gt
