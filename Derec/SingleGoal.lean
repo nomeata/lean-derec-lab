@@ -270,7 +270,7 @@ def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
   | n,       5 => foo2 (n - 1) 4
   | n, .succ m => foo2 n m
   | _, _ => 0
-derecursify_with (wfRecursionSingleGoal · none none)
+derecursify_with wfRecursionSingleGoal
 termination_by foo2 n m => (m, n)
 decreasing_by
   done

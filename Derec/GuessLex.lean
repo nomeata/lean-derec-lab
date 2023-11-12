@@ -432,7 +432,7 @@ def ping (n : Nat) := pong n
    where pong : Nat → Nat
   | 0 => 0
   | .succ n => ping n
-derecursify_with (guessLex · none none)
+derecursify_with guessLex
 
 
 def foo2 : Nat → Nat → Nat
@@ -443,19 +443,19 @@ def foo2 : Nat → Nat → Nat
   | n,       5 => foo2 (n - 1) 4
   | n, .succ m => foo2 n m
   | _, _ => 0
-derecursify_with (guessLex · none none)
+derecursify_with guessLex
 
 def ackermann (n m : Nat) := match n, m with
   | 0, m => m + 1
   | .succ n, 0 => ackermann n 1
   | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
-derecursify_with (guessLex · none none)
+derecursify_with guessLex
 
 def ackermann2 (n m : Nat) := match n, m with
   | m, 0 => m + 1
   | 0, .succ n => ackermann2 1 n
   | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
-derecursify_with (guessLex · none none)
+derecursify_with guessLex
 
 
 
@@ -469,5 +469,5 @@ def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
   | 0, 0, .succ d, e, f, g, h, i => .succ (blowup d d d e f g h i)
   | 0, .succ c, d, e, f, g, h, i => .succ (blowup c c d e f g h i)
   | .succ b, c, d, e, f, g, h, i => .succ (blowup b c d e f g h i)
--- derecursify_with (guessLex · none none)
+-- derecursify_with guessLex
 derecursify_with fun _ _ _ => return
