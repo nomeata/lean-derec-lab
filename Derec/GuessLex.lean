@@ -284,7 +284,7 @@ def GuessLexRel.toNatRel : GuessLexRel → Expr
 def lexGuessCol (recCalls : Array RecCallContext) (varIdx : Nat) : TermElabM (Array (Option GuessLexRel)):= do
   recCalls.mapM fun rcc => rcc.ctxt.run do
     trace[Elab.definition.wf] "lexGuesscol: {rcc.caller} {rcc.params} → {rcc.callee} {rcc.args}"
-    for rel in [GuessLexRel.lt, .eq, .le, .gt] do
+    for rel in [GuessLexRel.eq, .lt, .le, .gt] do
       let goalExpr := mkAppN rel.toNatRel #[rcc.args[varIdx]!, rcc.params[varIdx]!]
       trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
       check goalExpr
@@ -294,11 +294,14 @@ def lexGuessCol (recCalls : Array RecCallContext) (varIdx : Nat) : TermElabM (Ar
       let mvarId ← mvarId.cleanup
       -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
       try
-        let remainingGoals ← Tactic.run mvarId do
-          Tactic.evalTactic (← `(tactic| decreasing_tactic))
-        remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-        let expr ← instantiateMVars mvar
-        -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+        if rel = .eq then
+          MVarId.refl mvarId
+        else do
+          let remainingGoals ← Tactic.run mvarId do
+            Tactic.evalTactic (← `(tactic| decreasing_tactic))
+          remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
+          let expr ← instantiateMVars mvar
+          -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
         return rel
       catch _e =>
         -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
