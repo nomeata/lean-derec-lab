@@ -13,10 +13,6 @@ def naryVarNames (preDef : PreDefinition) : TermElabM (Array Name):= do
   lambdaTelescope preDef.value fun xs _ => do
     xs.mapM fun x => x.fvarId!.getUserName
 
-@[reducible]
-def M (recFnName : Name) (α β : Type) : Type :=
-  StateRefT (Array α) (StateRefT (HasConstCache recFnName) TermElabM) β
-
 /-- Given
   - matcherApp `match_i As (fun xs => motive[xs]) discrs (fun ys_1 => (alt_1 : motive (C_1[ys_1])) ... (fun ys_n => (alt_n : motive (C_n[ys_n]) remaining`, and
   - expression `e : B[discrs]`,
@@ -98,6 +94,9 @@ def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (A
       Expr.abstractM body fvs
     return res
 
+@[reducible]
+def M (recFnName : Name) (α β : Type) : Type :=
+  StateRefT (Array α) (StateRefT (HasConstCache recFnName) TermElabM) β
 
 partial def withRecApps {α} (recFnName : Name) (fixedPrefixSize : Nat) (e : Expr) (scrut : Expr)
     (k : Expr → Array Expr → TermElabM α) : TermElabM (Array α) := do
@@ -111,12 +110,14 @@ where
     else
       let a ← k scrut e.getAppArgs
       modifyThe (Array α) (·.push a)
-      return
 
   processApp (scrut : Expr) (e : Expr) : M recFnName α Unit := do
-    e.withApp fun _f args => args.forM (loop scrut)
-    if e.isAppOf recFnName then
-      processRec scrut e
+    e.withApp fun f args => do
+      args.forM (loop scrut)
+      if f.isConstOf recFnName then
+        processRec scrut e
+      else
+        loop scrut f
 
   containsRecFn (e : Expr) : M recFnName α Bool := do
     modifyGetThe (HasConstCache recFnName) (·.contains e)
@@ -145,7 +146,7 @@ where
       else
         loop scrut b
     | Expr.proj _n _i e => loop scrut e
-    | Expr.const .. => if e.isConstOf recFnName then processRec scrut e else return
+    | Expr.const .. => if e.isConstOf recFnName then processRec scrut e
     | Expr.app .. =>
       match (← matchMatcherApp? e) with
       | some matcherApp =>
@@ -169,7 +170,6 @@ where
       | none => processApp scrut e
     | e => do
       let _ ← ensureNoRecFn recFnName e
-      return
 
 private partial def withUnary {α} (preDef : PreDefinition) (prefixSize : Nat) (mvarId : MVarId) (fvarId : FVarId)
     (k : MVarId → Array FVarId → TermElabM α) : TermElabM α := do
@@ -190,33 +190,83 @@ private partial def withUnary {α} (preDef : PreDefinition) (prefixSize : Nat) (
       k mvarId (fvarIds.push fvarId)
   go 0 mvarId fvarId #[]
 
-/-- A `RecCallContext` focuses on a single recursive call in a unary predefinition,
-and runs the given action in the context of that call. The arguments are
-the function's unary argument, refined by case analysis, and the recursive call'
-unary argument.
+/-- A `SavedLocalCtxt` captures the local context (e.g. of a recursive call),
+so that it can be resumed later.
 -/
-structure RecCallContext where
-  param : Expr
-  arg : Expr
+structure SavedLocalCtxt where
   savedState : Term.SavedState
   savedLocalContext : LocalContext
   savedLocalInstances : LocalInstances
   savedTermContext : Term.Context
 
-def RecCallContext.create (param arg : Expr) : TermElabM RecCallContext := do
+def SavedLocalCtxt.create : TermElabM SavedLocalCtxt := do
   let savedState ← saveState
   let savedLocalContext ← getLCtx
   let savedLocalInstances ← getLocalInstances
   let savedTermContext ← readThe Term.Context
-  return { param, arg, savedState, savedLocalContext, savedLocalInstances, savedTermContext }
+  return { savedState, savedLocalContext, savedLocalInstances, savedTermContext }
 
 
-def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
+def SavedLocalCtxt.run {α} (slc : SavedLocalCtxt) (k : TermElabM α) :
     TermElabM α := withoutModifyingState $ do
-  restoreState rcc.savedState
-  withLCtx rcc.savedLocalContext rcc.savedLocalInstances do
-  withTheReader Term.Context (fun _ => rcc.savedTermContext) do
-  k rcc.param rcc.arg
+  restoreState slc.savedState
+  withLCtx slc.savedLocalContext slc.savedLocalInstances do
+  withTheReader Term.Context (fun _ => slc.savedTermContext) do
+  k
+
+def SavedLocalCtxt.within {α} (slc : SavedLocalCtxt) (k : TermElabM α) :
+    TermElabM (SavedLocalCtxt × α) :=
+  slc.run do
+    let x ← k
+    let slc' ← SavedLocalCtxt.create
+    pure (slc', x)
+
+
+/-- A `RecCallContext` focuses on a single recursive call in a unary predefinition,
+and runs the given action in the context of that call.
+-/
+structure RecCallContext where
+  --- Function index of caller
+  caller : Nat
+  --- Parameters of caller
+  params : Array Expr
+  --- Function index of callee
+  callee : Nat
+  --- Arguments to callee
+  args : Array Expr
+  ctxt : SavedLocalCtxt
+
+/-- Given the packed argument of a (possibly) mutual and (possibly) nary call,
+return the function index that is called and the arguments individually.
+Cf. `packMutual`
+TODO: pass in number of functions and arities to not overshoot
+-/
+def unpackArg (e : Expr) : (Nat × Array Expr) := Id.run do
+  -- count PSum injections to find out which function is doing the call
+  let mut funidx := 0
+  let mut e := e
+  while e.isAppOfArity ``PSum.inr 3 do
+    e := e.getArg! 2
+    funidx := funidx +1
+  if e.isAppOfArity ``PSum.inl 3 then
+    e := e.getArg! 2
+
+  -- now unpack PSigmas
+  let mut args := #[]
+  while e.isAppOfArity ``PSigma.mk 4 do
+    args := args.push (e.getArg! 2)
+    e := e.getArg! 3
+  args := args.push e
+  return (funidx, args)
+
+def RecCallContext.create (param arg : Expr) : TermElabM RecCallContext := do
+  let (caller, params) := unpackArg param
+  let (callee, args) := unpackArg arg
+  return { caller, params, callee, args, ctxt := (← SavedLocalCtxt.create) }
+
+-- def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
+--     TermElabM α := rcc.ctxt.run $ k rcc.param rcc.arg
+
 
 /-- Traverse a unary PreDefinition, and returns a `WithRecCall` closure for each recursive
 call site.
@@ -246,41 +296,28 @@ def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPre
     (packedArgType : Expr)
     (varNames : Array Name) (varIdx : Nat) : TermElabM (Array (Option GuessLexRel)):= do
   let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
-  recCalls.mapM fun rcc => rcc.run fun packed_param packed_arg => do
-      trace[Elab.definition.wf] "rcc.run: {packed_param} {packed_arg}"
-      withLetDecl (← mkFreshUserName `packed_param) packedArgType packed_param fun x => do
-      withLetDecl (← mkFreshUserName `packed_arg) packedArgType packed_arg fun arg => do
-        addAsAxiom unaryPreDef
-        for rel in [GuessLexRel.lt, .eq, .le, .gt] do
+  recCalls.mapM fun rcc => rcc.ctxt.run do
+      trace[Elab.definition.wf] "lexGuesscol: {rcc.caller} {rcc.params} → {rcc.callee} {rcc.args}"
+      addAsAxiom unaryPreDef
+      for rel in [GuessLexRel.lt, .eq, .le, .gt] do
+        let goalExpr := mkAppN rel.toNatRel #[rcc.args[varIdx]!, rcc.params[varIdx]!]
+        trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
+        check goalExpr
 
-          let goalMVar ← mkFreshExprSyntheticOpaqueMVar (.sort levelZero)
-          let goalMVarId := goalMVar.mvarId!
-          let [packedArgMVarId, packedParamMVarId] ← goalMVarId.apply rel.toNatRel | unreachable!
-
-          withUnary preDef fixedPrefixSize packedArgMVarId arg.fvarId! fun argMVarId fvarIds =>
-            argMVarId.assign (mkFVar fvarIds[varIdx]!)
-
-          withUnary preDef fixedPrefixSize packedParamMVarId x.fvarId! fun paramMVarId fvarIds =>
-            paramMVarId.assign (mkFVar fvarIds[varIdx]!)
-          let goalExpr ← instantiateMVars goalMVar
-
-          trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
-          check goalExpr
-
-          let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
-          let mvarId := mvar.mvarId!
-          let mvarId ← mvarId.cleanup
-          -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
-          try
-            let remainingGoals ← Tactic.run mvarId do
-              Tactic.evalTactic (← `(tactic| decreasing_tactic))
-            remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-            let expr ← instantiateMVars mvar
-            trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
-            return rel
-          catch e =>
-            trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
-        return .none
+        let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
+        let mvarId := mvar.mvarId!
+        let mvarId ← mvarId.cleanup
+        -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
+        try
+          let remainingGoals ← Tactic.run mvarId do
+            Tactic.evalTactic (← `(tactic| decreasing_tactic))
+          remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
+          let expr ← instantiateMVars mvar
+          trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+          return rel
+        catch e =>
+          trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
+      return .none
 
 -- NB: An array of columns
 def LexMatrix := Array (Array (Option GuessLexRel))
@@ -365,8 +402,11 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     let packedArgType := type.bindingDomain!
     -- Maybe do this before packMutual?
     trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
+
+    -- TODO: mutual
     let varNames ← naryVarNames preDefs[0]!
     trace[Elab.definition.wf] "varNames is: {varNames}"
+
     let cols : LexMatrix ← (List.range (varNames.size)).toArray.mapM fun i =>
       lexGuessCol preDefs[0]! unaryPreDef fixedPrefixSize packedArgType varNames i
     trace[Elab.definition.wf] "{cols.map (repr ·)}"
@@ -392,8 +432,13 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
 
 -- set_option trace.Elab.definition.wf true
--- set_option pp.inaccessibleNames true
--- set_option pp.auxDecls true
+
+def ping (n : Nat) := pong n
+   where pong : Nat → Nat
+  | 0 => 0
+  | .succ n => ping n
+derecursify_with (guessLex · none none)
+
 
 def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
   | .succ n, 1 => foo2 n 1
@@ -416,6 +461,8 @@ def ackermann2 (n m : Nat) := match n, m with
   | 0, .succ n => ackermann2 1 n
   | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
 derecursify_with (guessLex · none none)
+
+
 
 def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
   | 0, 0, 0, 0, 0, 0, 0, 0 => 0
