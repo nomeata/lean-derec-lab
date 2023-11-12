@@ -1,7 +1,5 @@
 import Lean.Elab.PreDefinition.Main
-
-
-
+import Lean.Elab.Quotation
 
 set_option autoImplicit false
 set_option linter.unusedVariables false
@@ -23,6 +21,7 @@ def M (recFnName : Name) (α β : Type) : Type :=
   - matcherApp `match_i As (fun xs => motive[xs]) discrs (fun ys_1 => (alt_1 : motive (C_1[ys_1])) ... (fun ys_n => (alt_n : motive (C_n[ys_n]) remaining`, and
   - expression `e : B[discrs]`,
   returns the expressions `B[C_1[ys_1]])  ... B[C_n[ys_n]]`.
+  (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
   Cf. `MatcherApp.addArg`.
 -/
 def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) : MetaM (Array Expr) :=
@@ -67,7 +66,7 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
   ```
   B[C_i[ys_i]]
   ```
-  (which `ys_i` as loose bound variable, ready to be `.instantiate`d)
+  (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
 -/
 def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (Array Expr) :=
   lambdaTelescope c.motive fun motiveArgs _motiveBody => do
@@ -115,10 +114,9 @@ where
       return
 
   processApp (scrut : Expr) (e : Expr) : M recFnName α Unit := do
+    e.withApp fun _f args => args.forM (loop scrut)
     if e.isAppOf recFnName then
       processRec scrut e
-    else
-      e.withApp fun _f args => args.forM (loop scrut)
 
   containsRecFn (e : Expr) : M recFnName α Bool := do
     modifyGetThe (HasConstCache recFnName) (·.contains e)
@@ -201,20 +199,22 @@ structure RecCallContext where
   param : Expr
   arg : Expr
   savedState : Term.SavedState
-  savedMetaContext : Meta.Context
+  savedLocalContext : LocalContext
+  savedLocalInstances : LocalInstances
   savedTermContext : Term.Context
 
 def RecCallContext.create (param arg : Expr) : TermElabM RecCallContext := do
   let savedState ← saveState
-  let savedMetaContext ← readThe Meta.Context
+  let savedLocalContext ← getLCtx
+  let savedLocalInstances ← getLocalInstances
   let savedTermContext ← readThe Term.Context
-  return { param, arg, savedState, savedMetaContext, savedTermContext }
+  return { param, arg, savedState, savedLocalContext, savedLocalInstances, savedTermContext }
 
 
 def RecCallContext.run {α} (rcc : RecCallContext) (k : Expr → Expr → TermElabM α) :
     TermElabM α := withoutModifyingState $ do
   restoreState rcc.savedState
-  withTheReader Meta.Context (fun _ => rcc.savedMetaContext) do
+  withLCtx rcc.savedLocalContext rcc.savedLocalInstances do
   withTheReader Term.Context (fun _ => rcc.savedTermContext) do
   k rcc.param rcc.arg
 
@@ -233,27 +233,26 @@ def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
       let arg := args[0]!
       RecCallContext.create param arg
 
-
-inductive GuessLexRel | lt | le | gt
-deriving Repr
+inductive GuessLexRel | lt | eq | le | gt
+deriving Repr, DecidableEq
 
 def GuessLexRel.toNatRel : GuessLexRel → Expr
   | lt => mkAppN (mkConst ``LT.lt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
+  | eq => mkAppN (mkConst ``Eq [levelOne]) #[mkConst ``Nat]
   | le => mkAppN (mkConst ``LE.le [levelZero]) #[mkConst ``Nat, mkConst ``instLENat]
   | gt => mkAppN (mkConst ``GT.gt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
 
 def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
     (packedArgType : Expr)
     (varNames : Array Name) (varIdx : Nat) : TermElabM (Array (Option GuessLexRel)):= do
-  let varNames ← lambdaTelescope preDef.value fun xs _ => do
-    xs.mapM fun x => x.fvarId!.getUserName
-
   let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
   recCalls.mapM fun rcc => rcc.run fun packed_param packed_arg => do
       trace[Elab.definition.wf] "rcc.run: {packed_param} {packed_arg}"
       withLetDecl (← mkFreshUserName `packed_param) packedArgType packed_param fun x => do
       withLetDecl (← mkFreshUserName `packed_arg) packedArgType packed_arg fun arg => do
-        for rel in [GuessLexRel.lt, .le, .gt] do
+        addAsAxiom unaryPreDef
+        for rel in [GuessLexRel.lt, .eq, .le, .gt] do
+
           let goalMVar ← mkFreshExprSyntheticOpaqueMVar (.sort levelZero)
           let goalMVarId := goalMVar.mvarId!
           let [packedArgMVarId, packedParamMVarId] ← goalMVarId.apply rel.toNatRel | unreachable!
@@ -265,7 +264,7 @@ def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPre
             paramMVarId.assign (mkFVar fvarIds[varIdx]!)
           let goalExpr ← instantiateMVars goalMVar
 
-          trace[Elab.definition.wf] "Goal (uncecked): {goalExpr}"
+          trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
           check goalExpr
 
           let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
@@ -283,11 +282,18 @@ def lexGuessCol (preDef : PreDefinition) (unaryPreDef : PreDefinition) (fixedPre
             trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
         return .none
 
-def prettyLexMatrix : Array Name → Array (Array (Option GuessLexRel)) → Format := fun names cols =>
-  if cols.isEmpty then "(no columns)" else
+-- NB: An array of columns
+def LexMatrix := Array (Array (Option GuessLexRel))
+
+def LexMatrix.rows (m : LexMatrix) : Nat := (m.get! 0).size
+def LexMatrix.cols (m : LexMatrix) : Nat := m.size
+def LexMatrix.get (m : LexMatrix) (i : Nat) (j : Nat) := (m.get! i).get! j
+
+def LexMatrix.pretty : LexMatrix → Array Name → Format := fun m names =>
+  if m.isEmpty then "(no columns)" else
     let header := #["Recursions:"].append (names.map (·.toString))
-    let rows := (List.range (cols[0]!.size)).toArray.map fun i =>
-      #[s!"Call {i+1}"].append (cols.map (fun col => prettyGuessLexRel col[i]!))
+    let rows := (List.range m.rows).toArray.map fun i =>
+      #[s!"Call {i+1}"].append (m.map (fun col => prettyGuessLexRel col[i]!))
     let table := #[header].append rows
     prettyTable table
   where
@@ -296,6 +302,7 @@ def prettyLexMatrix : Array Name → Array (Array (Option GuessLexRel)) → Form
       | some .lt => "<"
       | some .le => "≤"
       | some .gt => ">"
+      | some .eq => "="
 
     prettyTable : Array (Array String) → String := fun xss => Id.run $ do
       let mut colWidths := xss[0]!.map (fun _ => 0)
@@ -317,6 +324,32 @@ def prettyLexMatrix : Array Name → Array (Array (Option GuessLexRel)) → Form
       return str
 
 
+partial def LexMatrix.solve (m : LexMatrix) (acc : Array Nat) : Option (Array Nat) := Id.run do
+  if m.rows == 0 then return .some acc
+  -- Find the first column that has at least one < and otherwise only = or <=
+  for i in [:m.cols] do
+    let mut has_lt := false
+    let mut all_le := true
+    for j in [:m.rows] do
+      let entry := m.get i j
+      if entry = some .lt then
+        has_lt := true
+      else
+        if entry != some .le && entry != some .eq then
+          all_le := false
+          break
+    if not (has_lt && all_le) then continue
+    -- We found a suitable next column
+    -- Remove these columns and recurse
+    let m' : LexMatrix := m.map fun col => Id.run do
+      -- This is very ugly; find better data structure.
+      let mut col := col
+      for j in (List.range m.rows).reverse do
+        if m.get i j = some .lt then col := col.eraseIdx j
+      return col
+    return m'.solve (acc.push i)
+  return .none
+
 def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrTactic? : Option Syntax) : TermElabM Unit := do
   let (unaryPreDef, fixedPrefixSize) ← withoutModifyingEnv do
     for preDef in preDefs do
@@ -334,21 +367,65 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
     let varNames ← naryVarNames preDefs[0]!
     trace[Elab.definition.wf] "varNames is: {varNames}"
-    let cols ← (List.range (varNames.size)).toArray.mapM fun i =>
+    let cols : LexMatrix ← (List.range (varNames.size)).toArray.mapM fun i =>
       lexGuessCol preDefs[0]! unaryPreDef fixedPrefixSize packedArgType varNames i
-    trace[Elab.definition.wf] "cols is: {cols.map (repr ·)}"
-    logInfo (prettyLexMatrix varNames cols)
+    trace[Elab.definition.wf] "{cols.map (repr ·)}"
+    match cols.solve #[] with
+    | .some dec =>
+      -- logInfo <| m!"{cols.pretty varNames}" ++ Format.line ++ m!"{cols.solve #[]}"
+      let varsSyntax := varNames.map mkIdent
+      let bodySyntax ← Lean.Elab.Term.Quotation.mkTuple (dec.map (varsSyntax.get! ·))
+      -- dbg_trace (varsSyntax,bodySyntax)
+      -- we have an order that should work!
+      -- let's construct a `TerminationWf`
+      let termWF : TerminationWF := .ext #[
+        { ref := .missing -- is this the right function
+          declName := preDefs[0]!.declName
+          vars := varsSyntax
+          body := bodySyntax
+          implicit := true -- TODO
+        }
+      ]
+      wfRecursion preDefs termWF decrTactic?
+    | .none =>
+      throwError ("Cannot solve matrix:" ++ Format.line ++ cols.pretty varNames)
 
 
-set_option trace.Elab.definition.wf true
-set_option pp.inaccessibleNames true
-set_option pp.auxDecls true
+-- set_option trace.Elab.definition.wf true
+-- set_option pp.inaccessibleNames true
+-- set_option pp.auxDecls true
 
 def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
-  | .succ n, 0 => foo2 n 0
-  | .succ n, 1 => foo2 (.succ n) 1
-  | n, 2       => foo2 (.succ n) 2
-  | .succ n, m => foo2 m m
+  | .succ n, 1 => foo2 n 1
+  | .succ n, 2 => foo2 (.succ n) 1
+  | n,       3 => foo2 (.succ n) 2
+  | .succ n, 4 => foo2 (if n > 10 then n else .succ n) 3
+  | n,       5 => foo2 (n - 1) 4
   | n, .succ m => foo2 n m
   | _, _ => 0
 derecursify_with (guessLex · none none)
+
+def ackermann (n m : Nat) := match n, m with
+  | 0, m => m + 1
+  | .succ n, 0 => ackermann n 1
+  | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
+derecursify_with (guessLex · none none)
+
+def ackermann2 (n m : Nat) := match n, m with
+  | m, 0 => m + 1
+  | 0, .succ n => ackermann2 1 n
+  | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
+derecursify_with (guessLex · none none)
+
+def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
+  | 0, 0, 0, 0, 0, 0, 0, 0 => 0
+  | 0, 0, 0, 0, 0, 0, 0, .succ i => .succ (blowup i i i i i i i i)
+  | 0, 0, 0, 0, 0, 0, .succ h, i => .succ (blowup h h h h h h h i)
+  | 0, 0, 0, 0, 0, .succ g, h, i => .succ (blowup g g g g g g h i)
+  | 0, 0, 0, 0, .succ f, g, h, i => .succ (blowup f f f f f g h i)
+  | 0, 0, 0, .succ e, f, g, h, i => .succ (blowup e e e e f g h i)
+  | 0, 0, .succ d, e, f, g, h, i => .succ (blowup d d d e f g h i)
+  | 0, .succ c, d, e, f, g, h, i => .succ (blowup c c d e f g h i)
+  | .succ b, c, d, e, f, g, h, i => .succ (blowup b c d e f g h i)
+-- derecursify_with (guessLex · none none)
+derecursify_with fun _ _ _ => return
