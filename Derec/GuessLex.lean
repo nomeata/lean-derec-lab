@@ -275,6 +275,12 @@ def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
 inductive GuessLexRel | lt | eq | le | no_idea
 deriving Repr, DecidableEq
 
+instance : ToFormat GuessLexRel where
+  format | .lt => "<"
+         | .eq => "="
+         | .le => "≤"
+         | .no_idea => "?"
+
 def GuessLexRel.toNatRel : GuessLexRel → Expr
   | lt => mkAppN (mkConst ``LT.lt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
   | eq => mkAppN (mkConst ``Eq [levelOne]) #[mkConst ``Nat]
@@ -329,7 +335,7 @@ def evalRecCall (decrTactic? : Option Syntax) (rcc : RecCallContext) (paramIdx a
             pure ()
         return rel
       catch _e =>
-        trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
+        -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
         continue
     return .no_idea
 
@@ -355,6 +361,17 @@ def RecCallCache.eval (rc : RecCallCache) (callIdx paramIdx argIdx : Nat) :
     let res ← evalRecCall rc.decrTactic? rcc paramIdx argIdx
     rc.cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
     return res
+
+def RecCallCache.pretty (rc : RecCallCache) : IO Format := do
+  let mut r := Format.nil
+  let d ← rc.cache.get
+  for callIdx in [:d.size] do
+    for paramIdx in [:d[callIdx]!.size] do
+      for argIdx in [:d[callIdx]![paramIdx]!.size] do
+        if let .some entry := d[callIdx]![paramIdx]![argIdx]! then
+          r := r ++
+            f!"Call {callIdx +1} (Param {paramIdx}, arg {argIdx}): {entry}" ++ Format.line
+  return r
 
 /-- The measures that we order lexicographically can be comparing arguments,
 or numbering the functions -/
@@ -401,6 +418,7 @@ def getForbiddenByTrivialSizeOf (fixedPrefixSize : Nat) (preDef : PreDefinition)
 
 
 -- Generate all combination of arguments
+-- TODO: Sort the uniform combination ([0,0,0], [1,1,1]) to the front
 def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
     (threshold : Nat := 32) : Option (Array (Array Nat)) :=
   go 0 #[] |>.run #[] |>.2
@@ -423,49 +441,6 @@ where
         failure
 termination_by _ fidx => numArgs.size - fidx
 
-/-
-
--- NB: An array of columns
-def LexMatrix := Array (Array (Option GuessLexRel))
-
-def LexMatrix.rows (m : LexMatrix) : Nat := (m.get! 0).size
-def LexMatrix.cols (m : LexMatrix) : Nat := m.size
-def LexMatrix.get (m : LexMatrix) (i : Nat) (j : Nat) := (m.get! i).get! j
-
-def LexMatrix.pretty : LexMatrix → Array Name → Format := fun m names =>
-  if m.isEmpty then "(no columns)" else
-    let header := #["Recursions:"].append (names.map (·.eraseMacroScopes.toString))
-    let rows := (List.range m.rows).toArray.map fun i =>
-      #[s!"Call {i+1}"].append (m.map (fun col => prettyGuessLexRel col[i]!))
-    let table := #[header].append rows
-    prettyTable table
-  where
-    prettyGuessLexRel : GuessLexRel → String
-      | .no_idea => "?"
-      | .lt => "<"
-      | .le => "≤"
-      | .gt => ">"
-      | .eq => "="
-
-    prettyTable : Array (Array String) → String := fun xss => Id.run $ do
-      let mut colWidths := xss[0]!.map (fun _ => 0)
-      for i in [:xss.size] do
-        for j in [:xss[i]!.size] do
-          if xss[i]![j]!.length > colWidths[j]! then
-            colWidths := colWidths.set! j xss[i]![j]!.length
-      let mut str := ""
-      for i in [:xss.size] do
-        for j in [:xss[i]!.size] do
-          let s := xss[i]![j]!
-          for k in [:colWidths[j]! - s.length] do
-            str := str ++ " "
-          str := str ++ s
-          if j + 1 < xss[i]!.size then
-            str := str ++ " "
-        if i + 1 < xss.size then
-          str := str ++ "\n"
-      return str
--/
 
 /-- The core logic of guessing the lexicographic order
 For each call and measure, the `inspect` function indicates whether that measure is
@@ -542,7 +517,8 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
       | throwError "Too many combinations"
 
     let measures : Array MutualMeasure :=
-      (List.range varNamess.size).toArray.map .func ++ arg_measures.map .args
+      -- (List.range varNamess.size).toArray.map .func ++ arg_measures.map .args
+      arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
 
     match ← solve measures recCalls.size inspect with
     | .some solution =>
@@ -565,7 +541,7 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
       let termWF : TerminationWF := .ext termByElements
       wfRecursion preDefs termWF decrTactic?
     | .none =>
-      throwError ("Cannot solve")
+      throwError ("Cannot solve" ++ Format.line ++ (← rc.pretty) )
 
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
