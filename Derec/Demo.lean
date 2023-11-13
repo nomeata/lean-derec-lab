@@ -7,7 +7,7 @@ open Lean Elab
 def foo (n : Nat) : Nat := match n with
   | .zero => .zero
   | .succ n => foo n
-derecursify_with Structural.structuralRecursion
+derecursify_with fun defs _ _ => Structural.structuralRecursion defs
 
 def derec (preDefs : Array PreDefinition) : TermElabM Unit := do
   logInfo m!"{preDefs.map (·.declName)}"
@@ -16,4 +16,4 @@ def derec (preDefs : Array PreDefinition) : TermElabM Unit := do
 def foo2 (n : Nat) : Nat := match n with
   | .zero => .zero
   | .succ n => foo2 n
-derecursify_with derec
+derecursify_with fun defs _ _ => derec defs
