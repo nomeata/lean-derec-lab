@@ -291,7 +291,7 @@ def mkSizeOf (e : Expr) : TermElabM Expr := do
 
 -- For a given recursive call and choice of paramter index,
 -- try to prove requality, < or ≤
-def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
+def evalRecCall (decrTactic? : Option Syntax) (rcc : RecCallContext) (paramIdx argIdx : Nat) :
     TermElabM GuessLexRel := do
   rcc.ctxt.run do
     let param := rcc.params[paramIdx]!
@@ -312,31 +312,49 @@ def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
         if rel = .eq then
           MVarId.refl mvarId
         else do
-          let remainingGoals ← Tactic.run mvarId do
-            Tactic.evalTactic (← `(tactic| decreasing_tactic))
-          remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-          let expr ← instantiateMVars mvar
-          -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+           match decrTactic? with
+          | none =>
+            let remainingGoals ← Tactic.run mvarId do
+              Tactic.evalTactic (← `(tactic| decreasing_tactic))
+            remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
+            let expr ← instantiateMVars mvar
+            -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+            pure ()
+          | some decrTactic => Term.withoutErrToSorry do
+            -- make info from `runTactic` available
+            pushInfoTree (.hole mvarId)
+            Term.runTactic mvarId decrTactic
+            let expr ← instantiateMVars mvar
+            -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+            pure ()
         return rel
       catch _e =>
-        -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
+        trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
         continue
     return .no_idea
 
--- Like `evalRecCall`, but cached
-def evalRecCallCached (recCalls : Array RecCallContext) :
-    TermElabM (Nat → Nat → Nat → TermElabM GuessLexRel) := do
+-- A cache for `evalRecCall`
+structure RecCallCache where mk'' ::
+  decrTactic? : Option Syntax
+  recCalls : Array RecCallContext
+  cache : IO.Ref (Array (Array (Array (Option GuessLexRel))))
+
+def RecCallCache.mk (decrTactic? : Option Syntax) (recCalls : Array RecCallContext) :
+    BaseIO RecCallCache := do
   let cache ← IO.mkRef <| recCalls.map fun rcc =>
       Array.mkArray rcc.params.size (Array.mkArray rcc.args.size Option.none)
-  return fun callIdx paramIdx argIdx => do
-    let some rcc := recCalls[callIdx]? | unreachable!
-    -- Check the cache first
-    if let Option.some res := (← cache.get)[callIdx]![paramIdx]![argIdx]! then
-      return res
-    else
-      let res ← evalRecCall rcc paramIdx argIdx
-      cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
-      return res
+  return { decrTactic?, recCalls, cache }
+
+def RecCallCache.eval (rc : RecCallCache) (callIdx paramIdx argIdx : Nat) :
+    TermElabM GuessLexRel := do
+  let some rcc := rc.recCalls[callIdx]? | unreachable!
+  -- Check the cache first
+  if let Option.some res := (← rc.cache.get)[callIdx]![paramIdx]![argIdx]! then
+    return res
+  else
+    let res ← evalRecCall rc.decrTactic? rcc paramIdx argIdx
+    rc.cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
+    return res
 
 /-- The measures that we order lexicographically can be comparing arguments,
 or numbering the functions -/
@@ -346,14 +364,13 @@ inductive MutualMeasure where
   | func : Nat → MutualMeasure
 
 -- Evaluate a call at a given measure
-def inspectCall (recCalls : Array RecCallContext)
-    (evalCall : Nat → Nat → Nat → TermElabM GuessLexRel) :
+def inspectCall (recCalls : Array RecCallContext) (rc : RecCallCache) :
     MutualMeasure → Nat → TermElabM GuessLexRel
   | .args argIdxs, callIdx => do
     let some rcc := recCalls[callIdx]? | unreachable!
     let paramIdx := argIdxs[rcc.caller]!
     let argIdx := argIdxs[rcc.callee]!
-    evalCall callIdx paramIdx argIdx
+    rc.eval callIdx paramIdx argIdx
   | .func funIdx, callIdx => do
     let some rcc := recCalls[callIdx]? | unreachable!
     if rcc.caller == rcc.callee then
@@ -510,8 +527,8 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
     -- Collect all recursive calls and extract their context
     let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
-    let evalCall ← evalRecCallCached recCalls
-    let inspect := inspectCall recCalls evalCall
+    let rc ← RecCallCache.mk decrTactic? recCalls
+    let inspect := inspectCall recCalls rc
 
     let forbiddenArgs ← preDefs.mapM fun preDef =>
       getForbiddenByTrivialSizeOf fixedPrefixSize preDef
