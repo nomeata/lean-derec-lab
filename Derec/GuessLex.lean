@@ -15,8 +15,9 @@ Given a predefinition, find good variable names for its parameters.
 Use user-given parameter names if present; use x1...xn otherwise.
 TODO: Prettier code to generate x1...xn
 -/
-def naryVarNames (preDef : PreDefinition) : TermElabM (Array Name):= do
+def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (Array Name):= do
   lambdaTelescope preDef.value fun xs _ => do
+    let xs := xs.extract fixedPrefixSize xs.size
     let mut ns := #[]
     for i in List.range xs.size do
       let n ← xs[i]!.fvarId!.getUserName
@@ -269,7 +270,7 @@ def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
     -- assert xs.size  == fixedPrefixSize + 1
     let param := xs[fixedPrefixSize]!
     withRecApps unaryPreDef.declName fixedPrefixSize body param fun param args => do
-      let arg := args[0]!
+      let arg := args[fixedPrefixSize]!
       RecCallContext.create param arg
 
 inductive GuessLexRel | lt | eq | le | no_idea
@@ -498,7 +499,7 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     -- trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
 
     -- TODO: mutual
-    let varNamess ← preDefs.mapM naryVarNames
+    let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
     trace[Elab.definition.wf] "varNames is: {varNamess}"
 
     -- Collect all recursive calls and extract their context
@@ -587,8 +588,7 @@ def odd : Nat → Bool
 end
 derecursify_with guessLex
 
-/-
-set_option trace.Elab.definition.wf true in
+-- set_option trace.Elab.definition.wf true in
 mutual
 def evenWithFixed (m : String) : Nat → Bool
   | 0 => true
@@ -598,7 +598,6 @@ def oddWithFixed (m : String) : Nat → Bool
   | .succ n => not (evenWithFixed m n)
 end
 derecursify_with guessLex
--/
 
 def ping (n : Nat) := pong n
    where pong : Nat → Nat
