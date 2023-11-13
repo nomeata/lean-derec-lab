@@ -272,14 +272,13 @@ def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
       let arg := args[0]!
       RecCallContext.create param arg
 
-inductive GuessLexRel | lt | eq | le | gt | no_idea
+inductive GuessLexRel | lt | eq | le | no_idea
 deriving Repr, DecidableEq
 
 def GuessLexRel.toNatRel : GuessLexRel → Expr
   | lt => mkAppN (mkConst ``LT.lt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
   | eq => mkAppN (mkConst ``Eq [levelOne]) #[mkConst ``Nat]
   | le => mkAppN (mkConst ``LE.le [levelZero]) #[mkConst ``Nat, mkConst ``instLENat]
-  | gt => mkAppN (mkConst ``GT.gt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
   | no_idea => unreachable! -- TODO: keep it partial or refactor?
 
 -- For a given recursive call and choice of paramter index,
@@ -290,7 +289,7 @@ def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
     let param := rcc.params[paramIdx]!
     let arg := rcc.args[argIdx]!
     trace[Elab.definition.wf] "inspectRecCall: {rcc.caller} ({param}) → {rcc.callee} ({arg})"
-    for rel in [GuessLexRel.eq, .lt, .le, .gt] do
+    for rel in [GuessLexRel.eq, .lt, .le] do
       let goalExpr := mkAppN rel.toNatRel #[rcc.args[argIdx]!, rcc.params[paramIdx]!]
       trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
       check goalExpr
@@ -353,6 +352,26 @@ def inspectCall (recCalls : Array RecCallContext)
       return .lt
     else
       return .no_idea
+
+/--
+  Given a predefinition with value `fun (x_₁ ... xₙ) (y_₁ : α₁)... (yₘ : αₘ) => ...`,
+  where `n = fixedPrefixSize`, return an array `A` s.t. `i ∈ A` iff `sizeOf yᵢ` reduces to a literal.
+  This is the case for types such as `Prop`, `Type u`, etc.
+  This arguments should not be considered when guessing a well-founded relation.
+  See `generateCombinations?`
+-/
+def getForbiddenByTrivialSizeOf (fixedPrefixSize : Nat) (preDef : PreDefinition) : MetaM (Array Nat) :=
+  lambdaTelescope preDef.value fun xs _ => do
+    let mut result := #[]
+    for x in xs[fixedPrefixSize:], i in [:xs.size] do
+      try
+        let sizeOf ← whnfD (← mkAppM ``sizeOf #[x])
+        if sizeOf.isLit then
+         result := result.push i
+      catch _ =>
+        result := result.push i
+    return result
+
 
 -- Generate all combination of arguments
 def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
@@ -484,12 +503,15 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     let evalCall ← evalRecCallCached recCalls
     let inspect := inspectCall recCalls evalCall
 
+    let forbiddenArgs ← preDefs.mapM fun preDef =>
+      getForbiddenByTrivialSizeOf fixedPrefixSize preDef
+
     -- Enumerate all meausures.
     -- (With many functions with multiple arguments, this can explode a bit.
     -- We could interleave enumerating measure with early pruning based on the recCalls,
     -- once that becomes a problem. Until then, a use can always use an explicit
     -- `terminating_by` annotatin.)
-    let some arg_measures := generateCombinations? #[] (varNamess.map (·.size))
+    let some arg_measures := generateCombinations? forbiddenArgs (varNamess.map (·.size))
       | throwError "Too many combinations"
 
     let measures : Array MutualMeasure :=
@@ -521,6 +543,19 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
 
+def ackermann (n m : Nat) := match n, m with
+  | 0, m => m + 1
+  | .succ n, 0 => ackermann n 1
+  | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
+derecursify_with guessLex
+
+def ackermann2 (n m : Nat) := match n, m with
+  | m, 0 => m + 1
+  | 0, .succ n => ackermann2 1 n
+  | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
+derecursify_with guessLex
+
+
 def foo2 : Nat → Nat → Nat
   | .succ n, 1 => foo2 n 1
   | .succ n, 2 => foo2 (.succ n) 1
@@ -547,19 +582,13 @@ def ping (n : Nat) := pong n
   | .succ n => ping n
 derecursify_with guessLex
 
-
-def ackermann (n m : Nat) := match n, m with
-  | 0, m => m + 1
-  | .succ n, 0 => ackermann n 1
-  | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
+set_option trace.Elab.definition.wf false in
+def hasForbiddenArg (n : Nat) (h : n = n) (m : Nat) : Nat :=
+  match n, m with
+  | 0, 0 => 0
+  | .succ m, n => hasForbiddenArg m rfl n
+  | m, .succ n => hasForbiddenArg (.succ m) rfl n
 derecursify_with guessLex
-
-def ackermann2 (n m : Nat) := match n, m with
-  | m, 0 => m + 1
-  | 0, .succ n => ackermann2 1 n
-  | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
-derecursify_with guessLex
-
 
 
 def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
