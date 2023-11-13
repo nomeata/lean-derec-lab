@@ -284,57 +284,79 @@ def GuessLexRel.toNatRel : GuessLexRel → Expr
 
 -- For a given recursive call and choice of paramter index,
 -- try to prove requality, < or ≤
-def inspectRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) : TermElabM GuessLexRel := do
-  let param := rcc.params[paramIdx]!
-  let arg := rcc.args[argIdx]!
-  trace[Elab.definition.wf] "lexGuesscol: {rcc.caller} {param} → {rcc.callee} {arg}"
-  for rel in [GuessLexRel.eq, .lt, .le, .gt] do
-    let goalExpr := mkAppN rel.toNatRel #[rcc.args[argIdx]!, rcc.params[paramIdx]!]
-    trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
-    check goalExpr
+def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
+    TermElabM GuessLexRel := do
+  rcc.ctxt.run do
+    let param := rcc.params[paramIdx]!
+    let arg := rcc.args[argIdx]!
+    trace[Elab.definition.wf] "inspectRecCall: {rcc.caller} ({param}) → {rcc.callee} ({arg})"
+    for rel in [GuessLexRel.eq, .lt, .le, .gt] do
+      let goalExpr := mkAppN rel.toNatRel #[rcc.args[argIdx]!, rcc.params[paramIdx]!]
+      trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
+      check goalExpr
 
-    let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
-    let mvarId := mvar.mvarId!
-    let mvarId ← mvarId.cleanup
-    -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
-    try
-      if rel = .eq then
-        MVarId.refl mvarId
-      else do
-        let remainingGoals ← Tactic.run mvarId do
-          Tactic.evalTactic (← `(tactic| decreasing_tactic))
-        remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-        let expr ← instantiateMVars mvar
-        -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
-      return rel
-    catch _e =>
-      -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
-      continue
-  return .no_idea
+      let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
+      let mvarId := mvar.mvarId!
+      let mvarId ← mvarId.cleanup
+      -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
+      try
+        if rel = .eq then
+          MVarId.refl mvarId
+        else do
+          let remainingGoals ← Tactic.run mvarId do
+            Tactic.evalTactic (← `(tactic| decreasing_tactic))
+          remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
+          let expr ← instantiateMVars mvar
+          -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+        return rel
+      catch _e =>
+        -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
+        continue
+    return .no_idea
 
--- For each recursive function, which argument to decrease
-abbrev MutualMeasure := Array Nat
-
--- Like `inspectRecCall`, but cached
-def inspectRecCallCached (recCalls : Array RecCallContext) :
-    TermElabM (MutualMeasure → Nat → TermElabM GuessLexRel) := do
+-- Like `evalRecCall`, but cached
+def evalRecCallCached (recCalls : Array RecCallContext) :
+    TermElabM (Nat → Nat → Nat → TermElabM GuessLexRel) := do
   let cache ← IO.mkRef <| recCalls.map fun rcc =>
       Array.mkArray rcc.params.size (Array.mkArray rcc.args.size Option.none)
-  return fun mm callIdx => do
+  return fun callIdx paramIdx argIdx => do
     let some rcc := recCalls[callIdx]? | unreachable!
-    let paramIdx := mm[rcc.caller]!
-    let argIdx := mm[rcc.callee]!
     -- Check the cache first
     if let Option.some res := (← cache.get)[callIdx]![paramIdx]![argIdx]! then
       return res
     else
-      let res ← inspectRecCall rcc paramIdx argIdx
+      let res ← evalRecCall rcc paramIdx argIdx
       cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
       return res
 
+/-- The measures that we order lexicographically can be comparing arguments,
+or numbering the functions -/
+inductive MutualMeasure where
+  | args : Array Nat → MutualMeasure
+  --- The given function index is assigned 1, the rest 0
+  | func : Nat → MutualMeasure
+
+-- Evaluate a call at a given measure
+def inspectCall (recCalls : Array RecCallContext)
+    (evalCall : Nat → Nat → Nat → TermElabM GuessLexRel) :
+    MutualMeasure → Nat → TermElabM GuessLexRel
+  | .args argIdxs, callIdx => do
+    let some rcc := recCalls[callIdx]? | unreachable!
+    let paramIdx := argIdxs[rcc.caller]!
+    let argIdx := argIdxs[rcc.callee]!
+    evalCall callIdx paramIdx argIdx
+  | .func funIdx, callIdx => do
+    let some rcc := recCalls[callIdx]? | unreachable!
+    if rcc.caller == rcc.callee then
+      return .eq
+    else if rcc.caller == funIdx && rcc.callee != funIdx then
+      return .lt
+    else
+      return .no_idea
+
 -- Generate all combination of arguments
 def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
-    (threshold : Nat := 32) : Option (Array MutualMeasure) :=
+    (threshold : Nat := 32) : Option (Array (Array Nat)) :=
   go 0 #[] |>.run #[] |>.2
 where
   isForbidden (fidx : Nat) (argIdx : Nat) : Bool :=
@@ -354,7 +376,6 @@ where
       if (← get).size > threshold then
         failure
 termination_by _ fidx => numArgs.size - fidx
-
 
 /-
 
@@ -460,42 +481,45 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
     -- Collect all recursive calls and extract their context
     let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
-
-    let inspectCall ← inspectRecCallCached recCalls
+    let evalCall ← evalRecCallCached recCalls
+    let inspect := inspectCall recCalls evalCall
 
     -- Enumerate all meausures.
     -- (With many functions with multiple arguments, this can explode a bit.
     -- We could interleave enumerating measure with early pruning based on the recCalls,
     -- once that becomes a problem. Until then, a use can always use an explicit
     -- `terminating_by` annotatin.)
-    let some measures := generateCombinations? #[] (varNamess.map (·.size))
+    let some arg_measures := generateCombinations? #[] (varNamess.map (·.size))
       | throwError "Too many combinations"
 
-    match ← solve measures recCalls.size inspectCall with
+    let measures : Array MutualMeasure :=
+      (List.range varNamess.size).toArray.map .func ++ arg_measures.map .args
+
+    match ← solve measures recCalls.size inspect with
     | .some solution =>
-      logInfo <| m!"Solution: {solution}"
+      -- logInfo <| m!"Solution: {solution}"
       let mut termByElements := #[]
       for h : funIdx in [:varNamess.size] do
-        let varsSyntax := (varNamess[funIdx]'h.2).map mkIdent
-        let varIdxs := solution.map (·[funIdx]!)
-        let bodySyntax ← Lean.Elab.Term.Quotation.mkTuple (varIdxs.map (varsSyntax.get! ·))
+        let vars := (varNamess[funIdx]'h.2).map mkIdent
+        let body := ← Lean.Elab.Term.Quotation.mkTuple (← solution.mapM fun
+          | .args varIdxs => return vars.get! (varIdxs[funIdx]!)
+          | .func funIdx' => if funIdx' == funIdx then `(1) else `(0)
+          )
+        let declName := preDefs[funIdx]!.declName
+        -- TODO: Can we turn it into user-facing syntax? Maybe for a “try-this” feature?
+        trace[Elab.definition.wf] "Using termination {declName}: {vars} => {body}"
         termByElements := termByElements.push
           { ref := .missing -- is this the right function
-            declName := preDefs[funIdx]!.declName
-            vars := varsSyntax
-            body := bodySyntax
-            implicit := true -- TODO
+            declName, vars, body,
+            implicit := true -- TODO, what is this?
           }
       let termWF : TerminationWF := .ext termByElements
       wfRecursion preDefs termWF decrTactic?
     | .none =>
       throwError ("Cannot solve")
 
-
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
-
-
 
 def foo2 : Nat → Nat → Nat
   | .succ n, 1 => foo2 n 1
@@ -507,7 +531,15 @@ def foo2 : Nat → Nat → Nat
   | _, _ => 0
 derecursify_with guessLex
 
-#exit
+mutual
+def even : Nat → Bool
+  | 0 => true
+  | .succ n => not (odd n)
+def odd : Nat → Bool
+  | 0 => false
+  | .succ n => not (even n)
+end
+derecursify_with guessLex
 
 def ping (n : Nat) := pong n
    where pong : Nat → Nat
