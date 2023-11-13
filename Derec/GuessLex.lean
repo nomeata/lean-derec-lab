@@ -281,6 +281,14 @@ def GuessLexRel.toNatRel : GuessLexRel → Expr
   | le => mkAppN (mkConst ``LE.le [levelZero]) #[mkConst ``Nat, mkConst ``instLENat]
   | no_idea => unreachable! -- TODO: keep it partial or refactor?
 
+def mkSizeOf (e : Expr) : TermElabM Expr := do
+  let ty ← inferType e
+  let lvl ← getLevel ty
+  let inst ← synthInstance (mkAppN (mkConst ``SizeOf [lvl]) #[ty])
+  let res := mkAppN (mkConst ``sizeOf [lvl]) #[ty,  inst, e]
+  check res
+  return res
+
 -- For a given recursive call and choice of paramter index,
 -- try to prove requality, < or ≤
 def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
@@ -289,8 +297,10 @@ def evalRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) :
     let param := rcc.params[paramIdx]!
     let arg := rcc.args[argIdx]!
     trace[Elab.definition.wf] "inspectRecCall: {rcc.caller} ({param}) → {rcc.callee} ({arg})"
+    let arg ← mkSizeOf rcc.args[argIdx]!
+    let param ← mkSizeOf rcc.params[paramIdx]!
     for rel in [GuessLexRel.eq, .lt, .le] do
-      let goalExpr := mkAppN rel.toNatRel #[rcc.args[argIdx]!, rcc.params[paramIdx]!]
+      let goalExpr := mkAppN rel.toNatRel #[arg, param]
       trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
       check goalExpr
 
@@ -555,6 +565,13 @@ def ackermann2 (n m : Nat) := match n, m with
   | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
 derecursify_with guessLex
 
+def ackermannList (n m : List Unit) := match n, m with
+  | [], m => () :: m
+  | ()::n, [] => ackermannList n [()]
+  | ()::n, ()::m => ackermannList n (ackermannList (()::n) m)
+derecursify_with guessLex
+
+
 
 def foo2 : Nat → Nat → Nat
   | .succ n, 1 => foo2 n 1
@@ -575,6 +592,19 @@ def odd : Nat → Bool
   | .succ n => not (even n)
 end
 derecursify_with guessLex
+
+/-
+set_option trace.Elab.definition.wf true in
+mutual
+def evenWithFixed (m : String) : Nat → Bool
+  | 0 => true
+  | .succ n => not (oddWithFixed m n)
+def oddWithFixed (m : String) : Nat → Bool
+  | 0 => false
+  | .succ n => not (evenWithFixed m n)
+end
+derecursify_with guessLex
+-/
 
 def ping (n : Nat) := pong n
    where pong : Nat → Nat
