@@ -390,12 +390,13 @@ def inspectCall (recCalls : Array RecCallContext) (rc : RecCallCache) :
     rc.eval callIdx paramIdx argIdx
   | .func funIdx, callIdx => do
     let some rcc := recCalls[callIdx]? | unreachable!
-    if rcc.caller == rcc.callee then
-      return .eq
-    else if rcc.caller == funIdx && rcc.callee != funIdx then
+    if rcc.caller == funIdx && rcc.callee != funIdx then
       return .lt
-    else
+    if rcc.caller != funIdx && rcc.callee == funIdx then
       return .no_idea
+    else
+      return .eq
+
 
 /--
   Given a predefinition with value `fun (x_₁ ... xₙ) (y_₁ : α₁)... (yₘ : αₘ) => ...`,
