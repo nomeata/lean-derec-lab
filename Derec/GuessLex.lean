@@ -548,25 +548,27 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
 
+-- set_option trace.Elab.definition.wf true in
 def ackermann (n m : Nat) := match n, m with
   | 0, m => m + 1
   | .succ n, 0 => ackermann n 1
   | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
 derecursify_with guessLex
+-- termination_by _ n m => (n, m)
 
 def ackermann2 (n m : Nat) := match n, m with
   | m, 0 => m + 1
   | 0, .succ n => ackermann2 1 n
   | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
 derecursify_with guessLex
+-- termination_by _ n m => (m, n)
 
 def ackermannList (n m : List Unit) := match n, m with
   | [], m => () :: m
   | ()::n, [] => ackermannList n [()]
   | ()::n, ()::m => ackermannList n (ackermannList (()::n) m)
 derecursify_with guessLex
-
-
+-- termination_by _ n m => (n, m)
 
 def foo2 : Nat → Nat → Nat
   | .succ n, 1 => foo2 n 1
@@ -577,6 +579,7 @@ def foo2 : Nat → Nat → Nat
   | n, .succ m => foo2 n m
   | _, _ => 0
 derecursify_with guessLex
+-- termination_by _ n m => (m, n)
 
 mutual
 def even : Nat → Bool
@@ -604,6 +607,9 @@ def ping (n : Nat) := pong n
   | 0 => 0
   | .succ n => ping n
 derecursify_with guessLex
+-- termination_by
+--   ping n => (n, 1)
+--   pong n => (n, 0)
 
 set_option trace.Elab.definition.wf false in
 def hasForbiddenArg (n : Nat) (h : n = n) (m : Nat) : Nat :=
