@@ -272,7 +272,7 @@ def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
       let arg := args[0]!
       RecCallContext.create param arg
 
-inductive GuessLexRel | lt | eq | le | gt
+inductive GuessLexRel | lt | eq | le | gt | no_idea
 deriving Repr, DecidableEq
 
 def GuessLexRel.toNatRel : GuessLexRel → Expr
@@ -280,33 +280,83 @@ def GuessLexRel.toNatRel : GuessLexRel → Expr
   | eq => mkAppN (mkConst ``Eq [levelOne]) #[mkConst ``Nat]
   | le => mkAppN (mkConst ``LE.le [levelZero]) #[mkConst ``Nat, mkConst ``instLENat]
   | gt => mkAppN (mkConst ``GT.gt [levelZero]) #[mkConst ``Nat, mkConst ``instLTNat]
+  | no_idea => unreachable! -- TODO: keep it partial or refactor?
 
-def lexGuessCol (recCalls : Array RecCallContext) (varIdx : Nat) : TermElabM (Array (Option GuessLexRel)):= do
-  recCalls.mapM fun rcc => rcc.ctxt.run do
-    trace[Elab.definition.wf] "lexGuesscol: {rcc.caller} {rcc.params} → {rcc.callee} {rcc.args}"
-    for rel in [GuessLexRel.eq, .lt, .le, .gt] do
-      let goalExpr := mkAppN rel.toNatRel #[rcc.args[varIdx]!, rcc.params[varIdx]!]
-      trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
-      check goalExpr
+-- For a given recursive call and choice of paramter index,
+-- try to prove requality, < or ≤
+def inspectRecCall (rcc : RecCallContext) (paramIdx argIdx : Nat) : TermElabM GuessLexRel := do
+  let param := rcc.params[paramIdx]!
+  let arg := rcc.args[argIdx]!
+  trace[Elab.definition.wf] "lexGuesscol: {rcc.caller} {param} → {rcc.callee} {arg}"
+  for rel in [GuessLexRel.eq, .lt, .le, .gt] do
+    let goalExpr := mkAppN rel.toNatRel #[rcc.args[argIdx]!, rcc.params[paramIdx]!]
+    trace[Elab.definition.wf] "Goal (unchecked): {goalExpr}"
+    check goalExpr
 
-      let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
-      let mvarId := mvar.mvarId!
-      let mvarId ← mvarId.cleanup
-      -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
-      try
-        if rel = .eq then
-          MVarId.refl mvarId
-        else do
-          let remainingGoals ← Tactic.run mvarId do
-            Tactic.evalTactic (← `(tactic| decreasing_tactic))
-          remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-          let expr ← instantiateMVars mvar
-          -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
-        return rel
-      catch _e =>
-        -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
-        continue
-    return .none
+    let mvar ← mkFreshExprSyntheticOpaqueMVar goalExpr
+    let mvarId := mvar.mvarId!
+    let mvarId ← mvarId.cleanup
+    -- logInfo m!"Remaining goals: {goalsToMessageData [mvarId]}"
+    try
+      if rel = .eq then
+        MVarId.refl mvarId
+      else do
+        let remainingGoals ← Tactic.run mvarId do
+          Tactic.evalTactic (← `(tactic| decreasing_tactic))
+        remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
+        let expr ← instantiateMVars mvar
+        -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
+      return rel
+    catch _e =>
+      -- trace[Elab.definition.wf] "Did not find {repr rel} proof of {goalsToMessageData [mvarId]}"
+      continue
+  return .no_idea
+
+-- For each recursive function, which argument to decrease
+abbrev MutualMeasure := Array Nat
+
+-- Like `inspectRecCall`, but cached
+def inspectRecCallCached (recCalls : Array RecCallContext) :
+    TermElabM (MutualMeasure → Nat → TermElabM GuessLexRel) := do
+  let cache ← IO.mkRef <| recCalls.map fun rcc =>
+      Array.mkArray rcc.params.size (Array.mkArray rcc.args.size Option.none)
+  return fun mm callIdx => do
+    let some rcc := recCalls[callIdx]? | unreachable!
+    let paramIdx := mm[rcc.caller]!
+    let argIdx := mm[rcc.callee]!
+    -- Check the cache first
+    if let Option.some res := (← cache.get)[callIdx]![paramIdx]![argIdx]! then
+      return res
+    else
+      let res ← inspectRecCall rcc paramIdx argIdx
+      cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
+      return res
+
+-- Generate all combination of arguments
+def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
+    (threshold : Nat := 32) : Option (Array MutualMeasure) :=
+  go 0 #[] |>.run #[] |>.2
+where
+  isForbidden (fidx : Nat) (argIdx : Nat) : Bool :=
+    if h : fidx < forbiddenArgs.size then
+       forbiddenArgs.get ⟨fidx, h⟩ |>.contains argIdx
+    else
+      false
+
+  go (fidx : Nat) : OptionT (ReaderT (Array Nat) (StateM (Array (Array Nat)))) Unit := do
+    if h : fidx < numArgs.size then
+      let n := numArgs.get ⟨fidx, h⟩
+      for argIdx in [:n] do
+        unless isForbidden fidx argIdx do
+          withReader (·.push argIdx) (go (fidx + 1))
+    else
+      modify (·.push (← read))
+      if (← get).size > threshold then
+        failure
+termination_by _ fidx => numArgs.size - fidx
+
+
+/-
 
 -- NB: An array of columns
 def LexMatrix := Array (Array (Option GuessLexRel))
@@ -323,12 +373,12 @@ def LexMatrix.pretty : LexMatrix → Array Name → Format := fun m names =>
     let table := #[header].append rows
     prettyTable table
   where
-    prettyGuessLexRel : Option GuessLexRel → String
-      | none => "?"
-      | some .lt => "<"
-      | some .le => "≤"
-      | some .gt => ">"
-      | some .eq => "="
+    prettyGuessLexRel : GuessLexRel → String
+      | .no_idea => "?"
+      | .lt => "<"
+      | .le => "≤"
+      | .gt => ">"
+      | .eq => "="
 
     prettyTable : Array (Array String) → String := fun xss => Id.run $ do
       let mut colWidths := xss[0]!.map (fun _ => 0)
@@ -348,33 +398,46 @@ def LexMatrix.pretty : LexMatrix → Array Name → Format := fun m names =>
         if i + 1 < xss.size then
           str := str ++ "\n"
       return str
+-/
 
+/-- The core logic of guessing the lexicographic order
+For each call and measure, the `inspect` function indicates whether that measure is
+decreasing, equal, less-or-equal or unknown.
+It finds a sequence of measures that is lexicographically decreasing.
 
-partial def LexMatrix.solve (m : LexMatrix) (acc : Array Nat) : Option (Array Nat) := Id.run do
-  if m.rows == 0 then return .some acc
-  -- Find the first column that has at least one < and otherwise only = or <=
-  for i in [:m.cols] do
-    let mut has_lt := false
-    let mut all_le := true
-    for j in [:m.rows] do
-      let entry := m.get i j
-      if entry = some .lt then
-        has_lt := true
-      else
-        if entry != some .le && entry != some .eq then
-          all_le := false
-          break
-    if not (has_lt && all_le) then continue
-    -- We found a suitable next column
-    -- Remove these columns and recurse
-    let m' : LexMatrix := m.map fun col => Id.run do
-      -- This is very ugly; find better data structure.
-      let mut col := col
-      for j in (List.range m.rows).reverse do
-        if m.get i j = some .lt then col := col.eraseIdx j
-      return col
-    return m'.solve (acc.push i)
-  return .none
+It is monadic only so that `inspect` can be implemented lazily, otherwise it is
+a pure function.
+-/
+partial def solve {m} {α} [Monad m] (measures : Array α)
+  (calls : Nat) (inspect : α → Nat → m GuessLexRel) : m (Option (Array α)) := do
+  go measures (Array.mkArray calls false) #[]
+  where
+  go (measures : Array α) (done : Array Bool) (acc : Array α) := do
+    if done.all (·) then return .some acc
+
+    -- Find the first measure that has at least one < and otherwise only = or <=
+    for h : measureIdx in [:measures.size] do
+      let measure := measures[measureIdx]'h.2
+      let mut has_lt := false
+      let mut all_le := true
+      let mut done' := done
+      for callIdx in [:calls] do
+        if done[callIdx]! then continue
+        let entry ← inspect measure callIdx
+        if entry = .lt then
+          has_lt := true
+          done' := done'.set! callIdx true
+        else
+          if entry != .le && entry != .eq then
+            all_le := false
+            break
+      -- No progress here? Try the next measure
+      if not (has_lt && all_le) then continue
+      -- We found a suitable measure, remove it from the list (mild optimization)
+      let measures' := measures.eraseIdx measureIdx
+      return ← go measures' done' (acc.push measure)
+    -- None found, we have to give up
+    return .none
 
 def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrTactic? : Option Syntax) : TermElabM Unit := do
   let (unaryPreDef, fixedPrefixSize) ← withoutModifyingEnv do
@@ -392,47 +455,46 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     -- trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
 
     -- TODO: mutual
-    let varNames ← naryVarNames preDefs[0]!
-    trace[Elab.definition.wf] "varNames is: {varNames}"
+    let varNamess ← preDefs.mapM naryVarNames
+    trace[Elab.definition.wf] "varNames is: {varNamess}"
 
     -- Collect all recursive calls and extract their context
     let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
 
-    let cols : LexMatrix ← (List.range (varNames.size)).toArray.mapM fun i =>
-      lexGuessCol recCalls i
-    trace[Elab.definition.wf] "{cols.map (repr ·)}"
+    let inspectCall ← inspectRecCallCached recCalls
 
-    if trace.Elab.definition.wf.lex_matrix.get (← getOptions) then
-      logInfo <| m!"{cols.pretty varNames}"
-    match cols.solve #[] with
-    | .some dec =>
-      logInfo <| m!"Solution: {cols.solve #[]}"
-      let varsSyntax := varNames.map mkIdent
-      let bodySyntax ← Lean.Elab.Term.Quotation.mkTuple (dec.map (varsSyntax.get! ·))
-      -- dbg_trace (varsSyntax,bodySyntax)
-      -- we have an order that should work!
-      -- let's construct a `TerminationWf`
-      let termWF : TerminationWF := .ext #[
-        { ref := .missing -- is this the right function
-          declName := preDefs[0]!.declName
-          vars := varsSyntax
-          body := bodySyntax
-          implicit := true -- TODO
-        }
-      ]
+    -- Enumerate all meausures.
+    -- (With many functions with multiple arguments, this can explode a bit.
+    -- We could interleave enumerating measure with early pruning based on the recCalls,
+    -- once that becomes a problem. Until then, a use can always use an explicit
+    -- `terminating_by` annotatin.)
+    let some measures := generateCombinations? #[] (varNamess.map (·.size))
+      | throwError "Too many combinations"
+
+    match ← solve measures recCalls.size inspectCall with
+    | .some solution =>
+      logInfo <| m!"Solution: {solution}"
+      let mut termByElements := #[]
+      for h : funIdx in [:varNamess.size] do
+        let varsSyntax := (varNamess[funIdx]'h.2).map mkIdent
+        let varIdxs := solution.map (·[funIdx]!)
+        let bodySyntax ← Lean.Elab.Term.Quotation.mkTuple (varIdxs.map (varsSyntax.get! ·))
+        termByElements := termByElements.push
+          { ref := .missing -- is this the right function
+            declName := preDefs[funIdx]!.declName
+            vars := varsSyntax
+            body := bodySyntax
+            implicit := true -- TODO
+          }
+      let termWF : TerminationWF := .ext termByElements
       wfRecursion preDefs termWF decrTactic?
     | .none =>
-      throwError ("Cannot solve matrix:" ++ Format.line ++ cols.pretty varNames)
+      throwError ("Cannot solve")
 
 
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
 
-def ping (n : Nat) := pong n
-   where pong : Nat → Nat
-  | 0 => 0
-  | .succ n => ping n
-derecursify_with guessLex
 
 
 def foo2 : Nat → Nat → Nat
@@ -444,6 +506,15 @@ def foo2 : Nat → Nat → Nat
   | n, .succ m => foo2 n m
   | _, _ => 0
 derecursify_with guessLex
+
+#exit
+
+def ping (n : Nat) := pong n
+   where pong : Nat → Nat
+  | 0 => 0
+  | .succ n => ping n
+derecursify_with guessLex
+
 
 def ackermann (n m : Nat) := match n, m with
   | 0, m => m + 1
