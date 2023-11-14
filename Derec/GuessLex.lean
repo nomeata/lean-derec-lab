@@ -358,35 +358,32 @@ def evalRecCall (decrTactic? : Option Syntax) (rcc : RecCallContext) (paramIdx a
 -- A cache for `evalRecCall`
 structure RecCallCache where mk'' ::
   decrTactic? : Option Syntax
-  recCalls : Array RecCallContext
-  cache : IO.Ref (Array (Array (Array (Option GuessLexRel))))
+  rcc : RecCallContext
+  cache : IO.Ref (Array (Array (Option GuessLexRel)))
 
-def RecCallCache.mk (decrTactic? : Option Syntax) (recCalls : Array RecCallContext) :
+def RecCallCache.mk (decrTactic? : Option Syntax) (rcc : RecCallContext) :
     BaseIO RecCallCache := do
-  let cache ← IO.mkRef <| recCalls.map fun rcc =>
-      Array.mkArray rcc.params.size (Array.mkArray rcc.args.size Option.none)
-  return { decrTactic?, recCalls, cache }
+  let cache ← IO.mkRef <| Array.mkArray rcc.params.size (Array.mkArray rcc.args.size Option.none)
+  return { decrTactic?, rcc, cache }
 
-def RecCallCache.eval (rc : RecCallCache) (callIdx paramIdx argIdx : Nat) :
+def RecCallCache.eval (rc: RecCallCache) (paramIdx argIdx : Nat) :
     TermElabM GuessLexRel := do
-  let some rcc := rc.recCalls[callIdx]? | unreachable!
   -- Check the cache first
-  if let Option.some res := (← rc.cache.get)[callIdx]![paramIdx]![argIdx]! then
+  if let Option.some res := (← rc.cache.get)[paramIdx]![argIdx]! then
     return res
   else
-    let res ← evalRecCall rc.decrTactic? rcc paramIdx argIdx
-    rc.cache.modify (·.modify callIdx (·.modify paramIdx (·.set! argIdx res)))
+    let res ← evalRecCall rc.decrTactic? rc.rcc paramIdx argIdx
+    rc.cache.modify (·.modify paramIdx (·.set! argIdx res))
     return res
 
 def RecCallCache.pretty (rc : RecCallCache) : IO Format := do
   let mut r := Format.nil
   let d ← rc.cache.get
-  for callIdx in [:d.size] do
-    for paramIdx in [:d[callIdx]!.size] do
-      for argIdx in [:d[callIdx]![paramIdx]!.size] do
-        if let .some entry := d[callIdx]![paramIdx]![argIdx]! then
-          r := r ++
-            f!"Call {callIdx +1} (Param {paramIdx}, arg {argIdx}): {entry}" ++ Format.line
+  for paramIdx in [:d.size] do
+    for argIdx in [:d[paramIdx]!.size] do
+      if let .some entry := d[paramIdx]![argIdx]! then
+        r := r ++
+          f!"(Param {paramIdx}, arg {argIdx}): {entry}" ++ Format.line
   return r
 
 /-- The measures that we order lexicographically can be comparing arguments,
@@ -397,22 +394,18 @@ inductive MutualMeasure where
   | func : Nat → MutualMeasure
 
 -- Evaluate a call at a given measure
-def inspectCall (recCalls : Array RecCallContext) (rc : RecCallCache) :
-    MutualMeasure → Nat → TermElabM GuessLexRel
-  | .args argIdxs, callIdx => do
-    let some rcc := recCalls[callIdx]? | unreachable!
-    let paramIdx := argIdxs[rcc.caller]!
-    let argIdx := argIdxs[rcc.callee]!
-    rc.eval callIdx paramIdx argIdx
-  | .func funIdx, callIdx => do
-    let some rcc := recCalls[callIdx]? | unreachable!
-    if rcc.caller == funIdx && rcc.callee != funIdx then
+def inspectCall (rc : RecCallCache) : MutualMeasure → TermElabM GuessLexRel
+  | .args argIdxs => do
+    let paramIdx := argIdxs[rc.rcc.caller]!
+    let argIdx := argIdxs[rc.rcc.callee]!
+    rc.eval paramIdx argIdx
+  | .func funIdx => do
+    if rc.rcc.caller == funIdx && rc.rcc.callee != funIdx then
       return .lt
-    if rcc.caller != funIdx && rcc.callee == funIdx then
+    if rc.rcc.caller != funIdx && rc.rcc.callee == funIdx then
       return .no_idea
     else
       return .eq
-
 
 /--
   Given a predefinition with value `fun (x_₁ ... xₙ) (y_₁ : α₁)... (yₘ : αₘ) => ...`,
@@ -471,33 +464,32 @@ where
 
 
 /-- The core logic of guessing the lexicographic order
-For each call and measure, the `inspect` function indicates whether that measure is
-decreasing, equal, less-or-equal or unknown.
-It finds a sequence of measures that is lexicographically decreasing.
+Given a matrix that for each call and measure indicates whether that measure is
+decreasing, equal, less-or-equal or unknown, It finds a sequence of measures
+that is lexicographically decreasing.
 
-It is monadic only so that `inspect` can be implemented lazily, otherwise it is
-a pure function.
+The matrix is implemented here as an array of monadic query methods only so that
+we can fill is lazily. Morally, this is a pure function
 -/
 partial def solve {m} {α} [Monad m] (measures : Array α)
-  (calls : Nat) (inspect : α → Nat → m GuessLexRel) : m (Option (Array α)) := do
-  go measures (Array.mkArray calls false) #[]
+  (calls : Array (α → m GuessLexRel)) : m (Option (Array α)) := do
+  go measures calls #[]
   where
-  go (measures : Array α) (done : Array Bool) (acc : Array α) := do
-    if done.all (·) then return .some acc
+  go (measures : Array α) (calls : Array (α → m GuessLexRel)) (acc : Array α) := do
+    if calls.isEmpty then return .some acc
 
     -- Find the first measure that has at least one < and otherwise only = or <=
     for h : measureIdx in [:measures.size] do
       let measure := measures[measureIdx]'h.2
       let mut has_lt := false
       let mut all_le := true
-      let mut done' := done
-      for callIdx in [:calls] do
-        if done[callIdx]! then continue
-        let entry ← inspect measure callIdx
+      let mut todo := #[]
+      for call in calls do
+        let entry ← call measure
         if entry = .lt then
           has_lt := true
-          done' := done'.set! callIdx true
         else
+          todo := todo.push call
           if entry != .le && entry != .eq then
             all_le := false
             break
@@ -505,7 +497,7 @@ partial def solve {m} {α} [Monad m] (measures : Array α)
       if not (has_lt && all_le) then continue
       -- We found a suitable measure, remove it from the list (mild optimization)
       let measures' := measures.eraseIdx measureIdx
-      return ← go measures' done' (acc.push measure)
+      return ← go measures' todo (acc.push measure)
     -- None found, we have to give up
     return .none
 
@@ -548,8 +540,8 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
   -- Collect all recursive calls and extract their context
   let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
-  let rc ← RecCallCache.mk decrTactic? recCalls
-  let inspect := inspectCall recCalls rc
+  let rcs ← recCalls.mapM (RecCallCache.mk decrTactic? ·)
+  let callMatrix := rcs.map (inspectCall ·)
 
   let forbiddenArgs ← preDefs.mapM fun preDef =>
     getForbiddenByTrivialSizeOf fixedPrefixSize preDef
@@ -567,7 +559,7 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
   let measures : Array MutualMeasure :=
     arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
 
-  match ← solve measures recCalls.size inspect with
+  match ← solve measures callMatrix with
   | .some solution =>
     let termWF ← buildTermWF (preDefs.map (·.declName)) varNamess solution
     wfRecursion preDefs termWF decrTactic?
