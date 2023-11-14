@@ -86,6 +86,7 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
 -/
 def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) : MetaM (Array Expr) :=
   lambdaTelescope matcherApp.motive fun motiveArgs _motiveBody => do
+    trace[Elab.definition.wf] "MatcherApp.transform {indentExpr e}"
     unless motiveArgs.size == matcherApp.discrs.size do
       -- This error can only happen if someone implemented a transformation that rewrites the motive created by `mkMatcher`.
       throwError "unexpected matcher application, motive must be lambda expression with #{matcherApp.discrs.size} arguments"
@@ -115,6 +116,7 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
       let body := body.getArg! 2
       -- and abstract over the parameters of the alternative again
       Expr.abstractM body fvs
+    trace[Elab.definition.wf] "MatcherApp.transform result {res.map indentExpr}"
     return res
 
 /--
@@ -130,6 +132,7 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
 -/
 def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (Array Expr) :=
   lambdaTelescope c.motive fun motiveArgs _motiveBody => do
+    trace[Elab.definition.wf] "CasesOnApp.transform: {indentExpr e}"
     unless motiveArgs.size == c.indices.size + 1 do
       throwError "failed to add argument to `casesOn` application, motive must be lambda expression with #{c.indices.size + 1} binders"
     let discrs := c.indices ++ #[c.major]
@@ -153,9 +156,11 @@ def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (A
     let altAuxTys ← altAuxs.mapM inferType
     let res ← altAuxTys.mapM fun altAux => do
       let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAux
+      trace[Elab.definition.wf] "alt fvs: {fvs}"
       let body := body.getArg! 2
       -- and abstract over the parameters of the alternative again
       Expr.abstractM body fvs
+    trace[Elab.definition.wf] "CasesOnApp.transform result {res.map indentExpr}"
     return res
 
 @[reducible]
@@ -229,6 +234,7 @@ where
         else
           let altScruts ← casesOnApp.transform scrut
           (Array.zip casesOnApp.alts altScruts).forM fun (alt, altScrut) =>
+            -- TODO: Use lambdaBoundedTelescope to not zoom past genuine alt paramters
             lambdaTelescope alt fun xs altBody => do
               loop (altScrut.instantiateRev xs) altBody
       | none => processApp scrut e
