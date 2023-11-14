@@ -1,5 +1,21 @@
-import Lean.Elab.PreDefinition.Main
+/-
+Copyright (c) 2023 Joachim Breitner. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Joachim Breitner
+-/
+
+import Lean.Util.HasConstCache
+import Lean.Meta.CasesOn
+import Lean.Meta.Match.Match
+import Lean.Meta.Tactic.Cleanup
+import Lean.Meta.Tactic.Refl
 import Lean.Elab.Quotation
+import Lean.Elab.RecAppSyntax
+import Lean.Elab.PreDefinition.Basic
+import Lean.Elab.PreDefinition.Structural.Basic
+import Lean.Elab.PreDefinition.WF.TerminationHint
+
+import Lean.Elab.PreDefinition.Main
 import Derec.Options
 
 /-!
@@ -37,12 +53,10 @@ by Lukas Bulwahn, Alexander Krauss, and Tobias Nipkow, 10.1007/978-3-540-74591-4
 -/
 
 set_option autoImplicit false
-set_option linter.unusedVariables false
 
 open Lean Meta Elab WF
 
-
-namespace Derec
+namespace Lean.Elab.WF.GuessLex
 
 /--
 Given a predefinition, find good variable names for its parameters.
@@ -71,7 +85,7 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
   Cf. `MatcherApp.addArg`.
 -/
 def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) : MetaM (Array Expr) :=
-  lambdaTelescope matcherApp.motive fun motiveArgs motiveBody => do
+  lambdaTelescope matcherApp.motive fun motiveArgs _motiveBody => do
     unless motiveArgs.size == matcherApp.discrs.size do
       -- This error can only happen if someone implemented a transformation that rewrites the motive created by `mkMatcher`.
       throwError "unexpected matcher application, motive must be lambda expression with #{matcherApp.discrs.size} arguments"
@@ -373,14 +387,14 @@ def evalRecCall (decrTactic? : Option Syntax) (rcc : RecCallContext) (paramIdx a
             let remainingGoals ← Tactic.run mvarId do
               Tactic.evalTactic (← `(tactic| decreasing_tactic))
             remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
-            let expr ← instantiateMVars mvar
+            let _expr ← instantiateMVars mvar
             -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
             pure ()
           | some decrTactic => Term.withoutErrToSorry do
             -- make info from `runTactic` available
             pushInfoTree (.hole mvarId)
             Term.runTactic mvarId decrTactic
-            let expr ← instantiateMVars mvar
+            let _expr ← instantiateMVars mvar
             -- trace[Elab.definition.wf] "Found {repr rel} proof: {expr}"
             pure ()
         return rel
@@ -558,16 +572,15 @@ def buildTermWF (declNames : Array Name) (varNamess : Array (Array Name))
       }
   return .ext termByElements
 
-def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrTactic? : Option Syntax) : TermElabM Unit := do
-  let (unaryPreDef, fixedPrefixSize) ← withoutModifyingEnv do
-    for preDef in preDefs do
-      addAsAxiom preDef
-    let fixedPrefixSize ← getFixedPrefix preDefs
-    trace[Elab.definition.wf] "fixed prefix: {fixedPrefixSize}"
-    let preDefsDIte ← preDefs.mapM fun preDef => return { preDef with value := (← iteToDIte preDef.value) }
-    let unaryPreDefs ← packDomain fixedPrefixSize preDefsDIte
-    return (← packMutual fixedPrefixSize preDefs unaryPreDefs, fixedPrefixSize)
+end Lean.Elab.WF.GuessLex
 
+namespace Lean.Elab.WF
+
+open Lean.Elab.WF.GuessLex
+
+def guessLex (preDefs : Array PreDefinition)  (unaryPreDef : PreDefinition)
+    (fixedPrefixSize : Nat )(decrTactic? : Option Syntax) :
+    TermElabM TerminationWF := do
   let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
   let arities := varNamess.map (·.size)
   trace[Elab.definition.wf] "varNames is: {varNamess}"
@@ -595,14 +608,27 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
   match ← solve measures callMatrix with
   | .some solution =>
-    let termWF ← buildTermWF (preDefs.map (·.declName)) varNamess solution
-    wfRecursion preDefs termWF decrTactic?
+     buildTermWF (preDefs.map (·.declName)) varNamess solution
   | .none =>
-    logWarning ("Could not find a lexicographic ordering for which the function definition" ++
-      " terminates.")
-    -- Continue with the first allowed measure, so that the user sees some failing goals.
-    let termWF ← buildTermWF (preDefs.map (·.declName)) varNamess (measures.extract 0 1)
-    wfRecursion preDefs termWF decrTactic?
+    throwError "failed to prove termination, use `termination_by` to specify a well-founded relation"
+
+
+def withGuessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF)
+    (decrTactic? : Option Syntax) : TermElabM Unit := do
+  if let .some wf := wf? then
+    wfRecursion preDefs wf decrTactic?
+  else
+    let (unaryPreDef, fixedPrefixSize) ← withoutModifyingEnv do
+      for preDef in preDefs do
+        addAsAxiom preDef
+      let fixedPrefixSize ← getFixedPrefix preDefs
+      trace[Elab.definition.wf] "fixed prefix: {fixedPrefixSize}"
+      let preDefsDIte ← preDefs.mapM fun preDef => return { preDef with value := (← iteToDIte preDef.value) }
+      let unaryPreDefs ← packDomain fixedPrefixSize preDefsDIte
+      return (← packMutual fixedPrefixSize preDefs unaryPreDefs, fixedPrefixSize)
+
+    let wf ← guessLex preDefs unaryPreDef fixedPrefixSize decrTactic?
+    wfRecursion preDefs wf decrTactic?
 
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
@@ -612,21 +638,21 @@ def ackermann (n m : Nat) := match n, m with
   | 0, m => m + 1
   | .succ n, 0 => ackermann n 1
   | .succ n, .succ m => ackermann n (ackermann (n + 1) m)
-derecursify_with guessLex
+derecursify_with withGuessLex
 -- termination_by _ n m => (n, m)
 
 def ackermann2 (n m : Nat) := match n, m with
   | m, 0 => m + 1
   | 0, .succ n => ackermann2 1 n
   | .succ m, .succ n => ackermann2 (ackermann2 m (n + 1)) n
-derecursify_with guessLex
+derecursify_with withGuessLex
 -- termination_by _ n m => (m, n)
 
 def ackermannList (n m : List Unit) := match n, m with
   | [], m => () :: m
   | ()::n, [] => ackermannList n [()]
   | ()::n, ()::m => ackermannList n (ackermannList (()::n) m)
-derecursify_with guessLex
+derecursify_with withGuessLex
 -- termination_by _ n m => (n, m)
 
 def foo2 : Nat → Nat → Nat
@@ -637,7 +663,7 @@ def foo2 : Nat → Nat → Nat
   | n,       5 => foo2 (n - 1) 4
   | n, .succ m => foo2 n m
   | _, _ => 0
-derecursify_with guessLex
+derecursify_with withGuessLex
 -- termination_by _ n m => (m, n)
 
 mutual
@@ -648,7 +674,7 @@ def odd : Nat → Bool
   | 0 => false
   | .succ n => not (even n)
 end
-derecursify_with guessLex
+derecursify_with withGuessLex
 
 -- set_option trace.Elab.definition.wf true in
 mutual
@@ -659,24 +685,24 @@ def oddWithFixed (m : String) : Nat → Bool
   | 0 => false
   | .succ n => not (evenWithFixed m n)
 end
-derecursify_with guessLex
+derecursify_with withGuessLex
 
 def ping (n : Nat) := pong n
    where pong : Nat → Nat
   | 0 => 0
   | .succ n => ping n
-derecursify_with guessLex
+derecursify_with withGuessLex
 -- termination_by
 --   ping n => (n, 1)
 --   pong n => (n, 0)
 
 set_option trace.Elab.definition.wf false in
-def hasForbiddenArg (n : Nat) (h : n = n) (m : Nat) : Nat :=
+def hasForbiddenArg (n : Nat) (_h : n = n) (m : Nat) : Nat :=
   match n, m with
   | 0, 0 => 0
   | .succ m, n => hasForbiddenArg m rfl n
   | m, .succ n => hasForbiddenArg (.succ m) rfl n
-derecursify_with guessLex
+derecursify_with withGuessLex
 
 
 def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
@@ -695,15 +721,15 @@ derecursify_with fun _ _ _ => return
 -- Let’s try to confuse the lexicographic guessing function
 -- set_option trace.Elab.definition.wf true in
 def confuseLex1 : Nat → @PSigma Nat (fun _ => Nat) → Nat
-  | 0, p => 0
+  | 0, _p => 0
   | .succ n, ⟨x,y⟩ => confuseLex1 n ⟨x,y⟩
-derecursify_with guessLex
+derecursify_with withGuessLex
 
 -- set_option trace.Elab.definition.wf true in
 def confuseLex2 : @PSigma Nat (fun _ => Nat) → Nat
-  | ⟨y,0⟩ => 0
+  | ⟨_y,0⟩ => 0
   | ⟨y,.succ n⟩ => confuseLex2 ⟨y,n⟩
-derecursify_with guessLex
+derecursify_with withGuessLex
 
 
 -- set_option trace.Elab.definition.wf true in
@@ -713,4 +739,4 @@ def dependent : (n : Nat) → (m : Fin n) → Nat
  | .succ (.succ n), 0 => dependent (.succ n) ⟨n, n.lt_succ_self⟩
  | .succ (.succ n), ⟨.succ m, h⟩ =>
   dependent (.succ (.succ n)) ⟨m, Nat.lt_of_le_of_lt (Nat.le_succ _) h⟩
-derecursify_with guessLex
+derecursify_with withGuessLex
