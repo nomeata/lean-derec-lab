@@ -2,6 +2,40 @@ import Lean.Elab.PreDefinition.Main
 import Lean.Elab.Quotation
 import Derec.Options
 
+/-!
+
+This module implements heuristics to finding lexicographic termination measures
+for well-founded recursion. The goal is to try all lexicographic measures and
+find one for which all proof obligations go through with the given or default
+`decreasing_by` tatic.
+
+The crucial optimiziation is to look at each argument of each recursive call _once_,
+try to prove `<` and (if that fails `≤`), and then look at that table to pick a suitable
+measure. The next-crucial optimization is to fill that table lazily.
+
+This way, we run the (likely expensive) tactics as few times as possible, while still being
+able to consider a possibly large number of combinations.
+
+
+In the case of mutual recursion, a single measure is not just one argument position, but
+one argument from each recursive function. Enumerating these can lead to a combinatoric explosion,
+so we bound the nubmer of measures tried.
+
+In addition to measures derived from `sizeOf x` where `x` is an argument, it also considers
+measures that order the functions. This way we can support mutual function definitions where
+no arguments decrease from one function to another.
+
+The result of this module is a `TerminationWF`, which is then passed on to `wfRecursion`; this
+design is crucial so that whatever we infer in this module could also be written manually by the
+user. It would be bad if there are function definitions that can only be processed with the
+guessed lexicographic order.
+
+The logic here is based on “Finding Lexicographic Orders for Termination Proofs in Isabelle/HOL”
+by Lukas Bulwahn, Alexander Krauss, and Tobias Nipkow, 10.1007/978-3-540-74591-4_5
+<https://www21.in.tum.de/~nipkow/pubs/tphols07.pdf>.
+
+-/
+
 set_option autoImplicit false
 set_option linter.unusedVariables false
 
