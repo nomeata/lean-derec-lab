@@ -509,6 +509,29 @@ partial def solve {m} {α} [Monad m] (measures : Array α)
     -- None found, we have to give up
     return .none
 
+def buildTermWF (declNames : Array Name) (varNamess : Array (Array Name))
+    (measures : Array MutualMeasure) : TermElabM TerminationWF := do
+  -- logInfo <| m!"Solution: {solution}"
+  let mut termByElements := #[]
+  for h : funIdx in [:varNamess.size] do
+    let vars := (varNamess[funIdx]'h.2).map mkIdent
+    let body := ← Lean.Elab.Term.Quotation.mkTuple (← measures.mapM fun
+      | .args varIdxs =>
+          let v := vars.get! (varIdxs[funIdx]!)
+          `(sizeOf $v)
+      | .func funIdx' => if funIdx' == funIdx then `(1) else `(0)
+      )
+    let declName := declNames[funIdx]!
+
+    -- TODO: Can we turn it into user-facing syntax? Maybe for a “try-this” feature?
+    trace[Elab.definition.wf] "Using termination {declName}: {vars} => {body}"
+    termByElements := termByElements.push
+      { ref := .missing -- is this the right function
+        declName, vars, body,
+        implicit := true -- TODO, what is this?
+      }
+  return .ext termByElements
+
 def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrTactic? : Option Syntax) : TermElabM Unit := do
   let (unaryPreDef, fixedPrefixSize) ← withoutModifyingEnv do
     for preDef in preDefs do
@@ -518,59 +541,42 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
     let preDefsDIte ← preDefs.mapM fun preDef => return { preDef with value := (← iteToDIte preDef.value) }
     let unaryPreDefs ← packDomain fixedPrefixSize preDefsDIte
     return (← packMutual fixedPrefixSize preDefs unaryPreDefs, fixedPrefixSize)
-  /- let preDefNonRec ← -/
-  forallBoundedTelescope unaryPreDef.type fixedPrefixSize fun prefixArgs type => do
-    let type ← whnfForall type
-    let packedArgType := type.bindingDomain!
-    -- trace[Elab.definition.wf] "packedArgType is: {packedArgType}"
 
-    -- TODO: mutual
-    let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
-    let arities := varNamess.map (·.size)
-    trace[Elab.definition.wf] "varNames is: {varNamess}"
+  let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
+  let arities := varNamess.map (·.size)
+  trace[Elab.definition.wf] "varNames is: {varNamess}"
 
-    -- Collect all recursive calls and extract their context
-    let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
-    let rc ← RecCallCache.mk decrTactic? recCalls
-    let inspect := inspectCall recCalls rc
+  -- Collect all recursive calls and extract their context
+  let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
+  let rc ← RecCallCache.mk decrTactic? recCalls
+  let inspect := inspectCall recCalls rc
 
-    let forbiddenArgs ← preDefs.mapM fun preDef =>
-      getForbiddenByTrivialSizeOf fixedPrefixSize preDef
+  let forbiddenArgs ← preDefs.mapM fun preDef =>
+    getForbiddenByTrivialSizeOf fixedPrefixSize preDef
 
-    -- Enumerate all meausures.
-    -- (With many functions with multiple arguments, this can explode a bit.
-    -- We could interleave enumerating measure with early pruning based on the recCalls,
-    -- once that becomes a problem. Until then, a use can always use an explicit
-    -- `terminating_by` annotatin.)
-    let some arg_measures := generateCombinations? forbiddenArgs (varNamess.map (·.size))
-      | throwError "Too many combinations"
+  -- Enumerate all meausures.
+  -- (With many functions with multiple arguments, this can explode a bit.
+  -- We could interleave enumerating measure with early pruning based on the recCalls,
+  -- once that becomes a problem. Until then, a use can always use an explicit
+  -- `terminating_by` annotatin.)
+  let some arg_measures := generateCombinations? forbiddenArgs arities
+    | throwError "Too many combinations"
 
-    let measures : Array MutualMeasure :=
-      -- (List.range varNamess.size).toArray.map .func ++ arg_measures.map .args
-      arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
+  -- The list of measures, including the measures that order functions.
+  -- The function ordering measures should come last
+  let measures : Array MutualMeasure :=
+    arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
 
-    match ← solve measures recCalls.size inspect with
-    | .some solution =>
-      -- logInfo <| m!"Solution: {solution}"
-      let mut termByElements := #[]
-      for h : funIdx in [:varNamess.size] do
-        let vars := (varNamess[funIdx]'h.2).map mkIdent
-        let body := ← Lean.Elab.Term.Quotation.mkTuple (← solution.mapM fun
-          | .args varIdxs => return vars.get! (varIdxs[funIdx]!)
-          | .func funIdx' => if funIdx' == funIdx then `(1) else `(0)
-          )
-        let declName := preDefs[funIdx]!.declName
-        -- TODO: Can we turn it into user-facing syntax? Maybe for a “try-this” feature?
-        trace[Elab.definition.wf] "Using termination {declName}: {vars} => {body}"
-        termByElements := termByElements.push
-          { ref := .missing -- is this the right function
-            declName, vars, body,
-            implicit := true -- TODO, what is this?
-          }
-      let termWF : TerminationWF := .ext termByElements
-      wfRecursion preDefs termWF decrTactic?
-    | .none =>
-      throwError ("Cannot solve" ++ Format.line ++ (← rc.pretty) )
+  match ← solve measures recCalls.size inspect with
+  | .some solution =>
+    let termWF ← buildTermWF (preDefs.map (·.declName)) varNamess solution
+    wfRecursion preDefs termWF decrTactic?
+  | .none =>
+    logWarning ("Could not find a lexicographic ordering for which the function definition" ++
+      " terminates.")
+    -- Continue with the first allowed measure, so that the user sees some failing goals.
+    let termWF ← buildTermWF (preDefs.map (·.declName)) varNamess (measures.extract 0 1)
+    wfRecursion preDefs termWF decrTactic?
 
 -- set_option trace.Elab.definition.wf true
 set_option trace.Elab.definition.wf.lex_matrix true
@@ -671,4 +677,14 @@ derecursify_with guessLex
 def confuseLex2 : @PSigma Nat (fun _ => Nat) → Nat
   | ⟨y,0⟩ => 0
   | ⟨y,.succ n⟩ => confuseLex2 ⟨y,n⟩
+derecursify_with guessLex
+
+
+-- set_option trace.Elab.definition.wf true in
+def dependent : (n : Nat) → (m : Fin n) → Nat
+ | 0, i => Fin.elim0 i
+ | .succ 0, 0 => 0
+ | .succ (.succ n), 0 => dependent (.succ n) ⟨n, n.lt_succ_self⟩
+ | .succ (.succ n), ⟨.succ m, h⟩ =>
+  dependent (.succ (.succ n)) ⟨m, Nat.lt_of_le_of_lt (Nat.le_succ _) h⟩
 derecursify_with guessLex
