@@ -13,7 +13,8 @@ namespace Derec
 /--
 Given a predefinition, find good variable names for its parameters.
 Use user-given parameter names if present; use x1...xn otherwise.
-TODO: Prettier code to generate x1...xn
+The length of the returned array is also used to determine the arity
+of the function, so it should match what `packDomain` does.
 -/
 def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (Array Name):= do
   lambdaTelescope preDef.value fun xs _ => do
@@ -22,6 +23,7 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
     for i in List.range xs.size do
       let n ← xs[i]!.fvarId!.getUserName
       if n.hasMacroScopes then
+      -- TODO: Prettier code to generate x1...xn
         ns := ns.push (← mkFreshUserName (.mkSimple ("x" ++ (repr (i+1)).pretty)))
       else
         ns := ns.push n
@@ -234,44 +236,57 @@ structure RecCallContext where
 /-- Given the packed argument of a (possibly) mutual and (possibly) nary call,
 return the function index that is called and the arguments individually.
 Cf. `packMutual`
-TODO: pass in number of functions and arities to not overshoot
 -/
-def unpackArg (e : Expr) : (Nat × Array Expr) := Id.run do
+def unpackArg {m} [Monad m] [MonadError m] (arities : Array Nat) (e : Expr) :
+    m (Nat × Array Expr) := do
   -- count PSum injections to find out which function is doing the call
   let mut funidx := 0
   let mut e := e
-  while e.isAppOfArity ``PSum.inr 3 do
-    e := e.getArg! 2
-    funidx := funidx +1
-  if e.isAppOfArity ``PSum.inl 3 then
-    e := e.getArg! 2
+  while funidx + 1 < arities.size do
+    if e.isAppOfArity ``PSum.inr 3 then
+      e := e.getArg! 2
+      funidx := funidx + 1
+    else if e.isAppOfArity ``PSum.inl 3 then
+      e := e.getArg! 2
+      break
+    else
+      throwError "Unexpected expression while unpacking mutual argument"
 
   -- now unpack PSigmas
+  let arity := arities[funidx]!
   let mut args := #[]
-  while e.isAppOfArity ``PSigma.mk 4 do
-    args := args.push (e.getArg! 2)
-    e := e.getArg! 3
+  while args.size + 1 < arity do
+    if e.isAppOfArity ``PSigma.mk 4 then
+      args := args.push (e.getArg! 2)
+      e := e.getArg! 3
+    else
+      throwError "Unexpected expression while unpacking n-ary argument"
   args := args.push e
   return (funidx, args)
 
-def RecCallContext.create (param arg : Expr) : TermElabM RecCallContext := do
-  let (caller, params) := unpackArg param
-  let (callee, args) := unpackArg arg
+def RecCallContext.create (caller : Nat) (params : Array Expr) (callee : Nat) (args : Array Expr) :
+    TermElabM RecCallContext := do
   return { caller, params, callee, args, ctxt := (← SavedLocalCtxt.create) }
 
 /-- Traverse a unary PreDefinition, and returns a `WithRecCall` closure for each recursive
 call site.
 -/
-def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat)
+def collectRecCalls (unaryPreDef : PreDefinition) (fixedPrefixSize : Nat) (arities : Array Nat)
     : TermElabM (Array RecCallContext) := withoutModifyingState do
   addAsAxiom unaryPreDef
   lambdaTelescope unaryPreDef.value fun xs body => do
+    unless xs.size == fixedPrefixSize + 1 do
+      -- Maybe cleaner to have lambdaBoundedTelescope?
+      throwError "Unexpected number of lambdas in unary pre-definition"
     -- trace[Elab.definition.wf] "collectRecCalls: {xs} {body}"
-    -- assert xs.size  == fixedPrefixSize + 1
     let param := xs[fixedPrefixSize]!
     withRecApps unaryPreDef.declName fixedPrefixSize body param fun param args => do
+      unless args.size ≥ fixedPrefixSize + 1 do
+        throwError "Insufficient arguments in recursive call"
       let arg := args[fixedPrefixSize]!
-      RecCallContext.create param arg
+      let (caller, params) ← unpackArg arities param
+      let (callee, args) ← unpackArg arities arg
+      RecCallContext.create caller params callee args
 
 inductive GuessLexRel | lt | eq | le | no_idea
 deriving Repr, DecidableEq
@@ -419,29 +434,40 @@ def getForbiddenByTrivialSizeOf (fixedPrefixSize : Nat) (preDef : PreDefinition)
     return result
 
 
--- Generate all combination of arguments
--- TODO: Sort the uniform combination ([0,0,0], [1,1,1]) to the front
-def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
+-- Generate all combination of arguments, skipping those that are forbidden.
+-- Sorts the uniform combinations ([0,0,0], [1,1,1]) to the front; they
+-- are commonly most useful to try first, when the mutually recursive functions have similar
+-- argument structures
+partial def generateCombinations? (forbiddenArgs : Array (Array Nat)) (numArgs : Array Nat)
     (threshold : Nat := 32) : Option (Array (Array Nat)) :=
-  go 0 #[] |>.run #[] |>.2
+  (do goUniform 0; go 0 #[]) |>.run #[] |>.2
 where
   isForbidden (fidx : Nat) (argIdx : Nat) : Bool :=
     if h : fidx < forbiddenArgs.size then
-       forbiddenArgs.get ⟨fidx, h⟩ |>.contains argIdx
+       forbiddenArgs[fidx] |>.contains argIdx
     else
       false
 
+  -- Enumerate all permissible uniform combinations
+  goUniform (argIdx : Nat) : OptionT (StateM (Array (Array Nat))) Unit  := do
+    if numArgs.all (argIdx < ·) then
+      unless forbiddenArgs.any (·.contains argIdx) do
+        modify (·.push (Array.mkArray numArgs.size argIdx))
+      goUniform (argIdx + 1)
+
+  -- Enumerate all other permissible combinations
   go (fidx : Nat) : OptionT (ReaderT (Array Nat) (StateM (Array (Array Nat)))) Unit := do
     if h : fidx < numArgs.size then
-      let n := numArgs.get ⟨fidx, h⟩
+      let n := numArgs[fidx]
       for argIdx in [:n] do
         unless isForbidden fidx argIdx do
           withReader (·.push argIdx) (go (fidx + 1))
     else
-      modify (·.push (← read))
+      let comb ← read
+      unless comb.all (· == comb[0]!) do
+        modify (·.push comb)
       if (← get).size > threshold then
         failure
-termination_by _ fidx => numArgs.size - fidx
 
 
 /-- The core logic of guessing the lexicographic order
@@ -500,10 +526,11 @@ def guessLex (preDefs : Array PreDefinition) (wf? : Option TerminationWF) (decrT
 
     -- TODO: mutual
     let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
+    let arities := varNamess.map (·.size)
     trace[Elab.definition.wf] "varNames is: {varNamess}"
 
     -- Collect all recursive calls and extract their context
-    let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize
+    let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
     let rc ← RecCallCache.mk decrTactic? recCalls
     let inspect := inspectCall recCalls rc
 
@@ -632,3 +659,16 @@ def blowup : Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat → Nat
   | .succ b, c, d, e, f, g, h, i => .succ (blowup b c d e f g h i)
 -- derecursify_with guessLex
 derecursify_with fun _ _ _ => return
+
+-- Let’s try to confuse the lexicographic guessing function
+-- set_option trace.Elab.definition.wf true in
+def confuseLex1 : Nat → @PSigma Nat (fun _ => Nat) → Nat
+  | 0, p => 0
+  | .succ n, ⟨x,y⟩ => confuseLex1 n ⟨x,y⟩
+derecursify_with guessLex
+
+-- set_option trace.Elab.definition.wf true in
+def confuseLex2 : @PSigma Nat (fun _ => Nat) → Nat
+  | ⟨y,0⟩ => 0
+  | ⟨y,.succ n⟩ => confuseLex2 ⟨y,n⟩
+derecursify_with guessLex
