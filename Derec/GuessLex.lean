@@ -86,6 +86,8 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
 -/
 def _root_.Lean.Meta.MatcherApp.transform {m}
     -- TODO: Do we really need all these type classes?
+    -- I tried defining this in MetaM and use map2MetaM, but since the continuation is run
+    -- multiple times, this does not seem to work
     [MonadControlT MetaM m] [MonadLiftT MetaM m] [Monad m] [MonadOptions m] [MonadTrace m]
     [MonadLiftT IO m] [MonadError m] [AddMessageContext m]
     (matcherApp : MatcherApp) (e : Expr) (k : Expr → Expr → m Unit) : m Unit :=
@@ -93,7 +95,7 @@ def _root_.Lean.Meta.MatcherApp.transform {m}
     trace[Elab.definition.wf] "MatcherApp.transform {indentExpr e}"
     unless motiveArgs.size == matcherApp.discrs.size do
       -- This error can only happen if someone implemented a transformation that rewrites the motive created by `mkMatcher`.
-      throwError "unexpected matcher application, motive must be lambda expression with #{matcherApp.discrs.size} arguments"
+      throwError "failed to transfer argument through matcher application, motive must be lambda expression with #{matcherApp.discrs.size} arguments"
 
     let eAbst ← matcherApp.discrs.size.foldRevM (init := e) fun i eAbst => do
       let motiveArg := motiveArgs[i]!
@@ -111,7 +113,7 @@ def _root_.Lean.Meta.MatcherApp.transform {m}
     let aux := mkApp aux motive
     let aux := mkAppN aux matcherApp.discrs
     unless (← isTypeCorrect aux) do
-      throwError "failed to add argument to matcher application, type error when constructing the new motive"
+      throwError "failed to transfer argument through matcher application, type error when constructing the new motive"
     let auxType ← inferType aux
     let (altAuxs, _, _) ← Lean.Meta.forallMetaTelescope auxType
     let altAuxTys ← altAuxs.mapM (inferType ·)
@@ -122,9 +124,10 @@ def _root_.Lean.Meta.MatcherApp.transform {m}
     -- and abstract over the parameters of the alternative again
     let body ← Expr.abstractM body fvs
     -- Go under the lambdas of the alt
-    -- (TODO: Use bounded lambdaTelescope)
     lambdaTelescope alt fun xs altBody => do
-      let body := body.instantiateRev (xs.extract 0 fvs.size)
+      unless fvs.size ≤ xs.size do
+        throwError "failed to transfer argument through matcher application, alternative does not have enough manifest lambdas"
+      let body := body.instantiateRev xs[:fvs.size]
       trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
       k body altBody
 
@@ -147,7 +150,7 @@ def _root_.Lean.Meta.CasesOnApp.transform {m}
   lambdaTelescope c.motive fun motiveArgs _motiveBody => do
     trace[Elab.definition.wf] "CasesOnApp.transform: {indentExpr e}"
     unless motiveArgs.size == c.indices.size + 1 do
-      throwError "failed to add argument to `casesOn` application, motive must be lambda expression with #{c.indices.size + 1} binders"
+      throwError "failed to transfer argument through `casesOn` application, motive must be lambda expression with #{c.indices.size + 1} binders"
     let discrs := c.indices ++ #[c.major]
     let mut eAbst := e
     for motiveArg in motiveArgs.reverse, discr in discrs.reverse do
@@ -175,9 +178,10 @@ def _root_.Lean.Meta.CasesOnApp.transform {m}
       -- and abstract over the parameters of the alternative again
       let body ← Expr.abstractM body fvs
       -- Go under the lambdas of the alt
-      -- (TODO: Use bounded lambdaTelescope)
       lambdaTelescope alt fun xs altBody => do
-        let body := body.instantiateRev (xs.extract 0 fvs.size)
+        unless fvs.size ≤ xs.size do
+          throwError "failed to transfer argument through `casesOn` application, alternative does not have enough manifest lambdas"
+        let body := body.instantiateRev xs[:fvs.size]
         trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
         k body altBody
 
@@ -759,3 +763,26 @@ def dependent : (n : Nat) → (m : Fin n) → Nat
  | .succ (.succ n), ⟨.succ m, h⟩ =>
   dependent (.succ (.succ n)) ⟨m, Nat.lt_of_le_of_lt (Nat.le_succ _) h⟩
 derecursify_with withGuessLex
+
+inductive Expr where
+  | add (a b : Expr)
+  | val (n : Nat)
+
+mutual
+def eval (a : Expr) : Nat :=
+  match a with
+  | .add x y => eval_add (x, y)
+  | .val n => n
+
+def eval_add (a : Expr × Expr) : Nat :=
+  match a with
+  | (x, y) => eval x + eval y
+end
+derecursify_with withGuessLex
+
+def FinPlus1 n := Fin (n + 1)
+
+def badCasesOn (n : Nat) : Fin (n + 1) :=
+   Nat.casesOn (motive := FinPlus1) n (⟨0,Nat.zero_lt_succ _⟩) (fun n => Fin.succ (badCasesOn n))
+derecursify_with Lean.Elab.WF.withGuessLex
+-- termination_by badCasesOn n => n
