@@ -121,6 +121,13 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
       -- and abstract over the parameters of the alternatives, so that we can safely pass the Expr out
       Expr.abstractM body fvs
 
+/-- A non-failing version of `transform` -/
+def _root_.Lean.Meta.MatcherApp.transform? (matcherApp : MatcherApp) (e : Expr) :
+    MetaM (Option (Array Expr)) :=
+  try
+    return some (← matcherApp.transform e)
+  catch _ =>
+    return none
 
 
 /--
@@ -168,6 +175,14 @@ def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) :
       let body := body.getArg! 2
       -- and abstract over the parameters of the alternatives, so that we can safely pass the Expr out
       Expr.abstractM body fvs
+
+/-- A non-failing version of `transform` -/
+def _root_.Lean.Meta.CasesOnApp.transform? (c : CasesOnApp) (e : Expr) :
+    MetaM (Option (Array Expr)) :=
+  try
+    return some (← c.transform e)
+  catch _ =>
+    return none
 
 @[reducible]
 def M (recFnName : Name) (α β : Type) : Type :=
@@ -228,22 +243,24 @@ where
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          let altScruts ← matcherApp.transform scrut
-          (Array.zip matcherApp.alts (Array.zip matcherApp.altNumParams altScruts)).forM
-            fun (alt, altNumParam, altScrut) =>
-              lambdaTelescope alt fun xs altBody => do
-                unless altNumParam ≤ xs.size do
-                  throwError "unexpected matcher application alternative{indentExpr alt}\nat application{indentExpr e}"
-                let altScrut := altScrut.instantiateRev xs[:altNumParam]
-                trace[Elab.definition.wf] "MatcherApp.transform result {indentExpr altScrut}"
-                loop altScrut altBody
+          if let some altScruts ← matcherApp.transform? scrut then
+            (Array.zip matcherApp.alts (Array.zip matcherApp.altNumParams altScruts)).forM
+              fun (alt, altNumParam, altScrut) =>
+                lambdaTelescope alt fun xs altBody => do
+                  unless altNumParam ≤ xs.size do
+                    throwError "unexpected matcher application alternative{indentExpr alt}\nat application{indentExpr e}"
+                  let altScrut := altScrut.instantiateRev xs[:altNumParam]
+                  trace[Elab.definition.wf] "MatcherApp.transform result {indentExpr altScrut}"
+                  loop altScrut altBody
+          else
+            processApp scrut e
       | none =>
       match (← toCasesOnApp? e) with
       | some casesOnApp =>
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          let altScruts ← casesOnApp.transform scrut
+          if let some altScruts ← casesOnApp.transform? scrut then
           (Array.zip casesOnApp.alts (Array.zip casesOnApp.altNumParams altScruts)).forM
             fun (alt, altNumParam, altScrut) =>
               lambdaTelescope alt fun xs altBody => do
@@ -252,6 +269,8 @@ where
                 let altScrut := altScrut.instantiateRev xs[:altNumParam]
                 trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr altScrut}"
                 loop altScrut altBody
+          else
+            processApp scrut e
       | none => processApp scrut e
     | e => do
       let _ ← ensureNoRecFn recFnName e
