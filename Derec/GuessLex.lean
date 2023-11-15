@@ -64,7 +64,7 @@ Use user-given parameter names if present; use x1...xn otherwise.
 The length of the returned array is also used to determine the arity
 of the function, so it should match what `packDomain` does.
 -/
-def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (Array Name):= do
+def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : MetaM (Array Name):= do
   lambdaTelescope preDef.value fun xs _ => do
     let xs := xs.extract fixedPrefixSize xs.size
     let mut ns := #[]
@@ -622,7 +622,7 @@ def guessLex (preDefs : Array PreDefinition)  (unaryPreDef : PreDefinition)
     (fixedPrefixSize : Nat) (decrTactic? : Option Syntax) :
     TermElabM TerminationWF := do
   try
-    let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
+    let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize ·)
     let arities := varNamess.map (·.size)
     trace[Elab.definition.wf] "varNames is: {varNamess}"
 
