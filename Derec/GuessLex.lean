@@ -84,7 +84,11 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
   (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
   Cf. `MatcherApp.addArg`.
 -/
-def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) : MetaM (Array Expr) :=
+def _root_.Lean.Meta.MatcherApp.transform {m}
+    -- TODO: Do we really need all these type classes?
+    [MonadControlT MetaM m] [MonadLiftT MetaM m] [Monad m] [MonadOptions m] [MonadTrace m]
+    [MonadLiftT IO m] [MonadError m] [AddMessageContext m]
+    (matcherApp : MatcherApp) (e : Expr) (k : Expr → Expr → m Unit) : m Unit :=
   lambdaTelescope matcherApp.motive fun motiveArgs _motiveBody => do
     trace[Elab.definition.wf] "MatcherApp.transform {indentExpr e}"
     unless motiveArgs.size == matcherApp.discrs.size do
@@ -110,14 +114,19 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
       throwError "failed to add argument to matcher application, type error when constructing the new motive"
     let auxType ← inferType aux
     let (altAuxs, _, _) ← Lean.Meta.forallMetaTelescope auxType
-    let altAuxTys ← altAuxs.mapM inferType
-    let res ← altAuxTys.mapM fun altAux => do
-      let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAux
-      let body := body.getArg! 2
-      -- and abstract over the parameters of the alternative again
-      Expr.abstractM body fvs
-    trace[Elab.definition.wf] "MatcherApp.transform result {res.map indentExpr}"
-    return res
+    let altAuxTys ← altAuxs.mapM (inferType ·)
+    (Array.zip matcherApp.alts altAuxTys).forM fun (alt, altAuxTy) => do
+    let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAuxTy
+    trace[Elab.definition.wf] "alt fvs: {fvs}"
+    let body := body.getArg! 2
+    -- and abstract over the parameters of the alternative again
+    let body ← Expr.abstractM body fvs
+    -- Go under the lambdas of the alt
+    -- (TODO: Use bounded lambdaTelescope)
+    lambdaTelescope alt fun xs altBody => do
+      let body := body.instantiateRev (xs.extract 0 fvs.size)
+      trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
+      k body altBody
 
 /--
   Given a `casesOn` application `c` of the form
@@ -130,7 +139,11 @@ def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
   ```
   (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
 -/
-def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (Array Expr) :=
+def _root_.Lean.Meta.CasesOnApp.transform {m}
+  -- TODO: Do we really need all these type classes?
+  [MonadControlT MetaM m] [MonadLiftT MetaM m] [Monad m] [MonadOptions m] [MonadTrace m]
+  [MonadLiftT IO m] [MonadError m] [AddMessageContext m]
+    (c : CasesOnApp) (e : Expr) (k : Expr → Expr → m Unit) : m Unit :=
   lambdaTelescope c.motive fun motiveArgs _motiveBody => do
     trace[Elab.definition.wf] "CasesOnApp.transform: {indentExpr e}"
     unless motiveArgs.size == c.indices.size + 1 do
@@ -138,7 +151,8 @@ def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (A
     let discrs := c.indices ++ #[c.major]
     let mut eAbst := e
     for motiveArg in motiveArgs.reverse, discr in discrs.reverse do
-      eAbst := (← kabstract eAbst discr).instantiate1 motiveArg
+      eAbst ← kabstract eAbst discr
+      eAbst := eAbst.instantiate1 motiveArg
     -- Up to this point, this is cargo-culted from `CasesOn.App.addArg`
     -- Let's create something Prop-typed that mentions `e`, by writing `e = e`.
     let eEq ← mkEq eAbst eAbst
@@ -153,15 +167,19 @@ def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) : MetaM (A
     -- The type of the remaining arguments will mention `e` instantiated for each arg
     -- so extract them
     let (altAuxs, _, _) ← Lean.Meta.forallMetaTelescope auxType
-    let altAuxTys ← altAuxs.mapM inferType
-    let res ← altAuxTys.mapM fun altAux => do
-      let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAux
+    let altAuxTys ← altAuxs.mapM (inferType ·)
+    (Array.zip c.alts altAuxTys).forM fun (alt, altAuxTy) => do
+      let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAuxTy
       trace[Elab.definition.wf] "alt fvs: {fvs}"
       let body := body.getArg! 2
       -- and abstract over the parameters of the alternative again
-      Expr.abstractM body fvs
-    trace[Elab.definition.wf] "CasesOnApp.transform result {res.map indentExpr}"
-    return res
+      let body ← Expr.abstractM body fvs
+      -- Go under the lambdas of the alt
+      -- (TODO: Use bounded lambdaTelescope)
+      lambdaTelescope alt fun xs altBody => do
+        let body := body.instantiateRev (xs.extract 0 fvs.size)
+        trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
+        k body altBody
 
 @[reducible]
 def M (recFnName : Name) (α β : Type) : Type :=
@@ -222,21 +240,16 @@ where
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          let altScruts ← matcherApp.transform scrut
-          (Array.zip matcherApp.alts altScruts).forM fun (alt, altScrut) =>
-            lambdaTelescope alt fun xs altBody => do
-              loop (altScrut.instantiateRev xs) altBody
+          matcherApp.transform scrut fun scrut' altBody => do
+            loop scrut' altBody
       | none =>
       match (← toCasesOnApp? e) with
       | some casesOnApp =>
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          let altScruts ← casesOnApp.transform scrut
-          (Array.zip casesOnApp.alts altScruts).forM fun (alt, altScrut) =>
-            -- TODO: Use lambdaBoundedTelescope to not zoom past genuine alt paramters
-            lambdaTelescope alt fun xs altBody => do
-              loop (altScrut.instantiateRev xs) altBody
+          casesOnApp.transform scrut fun scrut' altBody => do
+            loop scrut' altBody
       | none => processApp scrut e
     | e => do
       let _ ← ensureNoRecFn recFnName e
