@@ -602,7 +602,7 @@ namespace Lean.Elab.WF
 open Lean.Elab.WF.GuessLex
 
 def guessLex (preDefs : Array PreDefinition)  (unaryPreDef : PreDefinition)
-    (fixedPrefixSize : Nat )(decrTactic? : Option Syntax) :
+    (fixedPrefixSize : Nat) (decrTactic? : Option Syntax) :
     TermElabM TerminationWF := do
   let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
   let arities := varNamess.map (·.size)
