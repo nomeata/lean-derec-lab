@@ -54,7 +54,7 @@ by Lukas Bulwahn, Alexander Krauss, and Tobias Nipkow, 10.1007/978-3-540-74591-4
 
 set_option autoImplicit false
 
-open Lean Meta Elab WF
+open Lean Meta Elab
 
 namespace Lean.Elab.WF.GuessLex
 
