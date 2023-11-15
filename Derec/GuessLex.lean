@@ -80,17 +80,12 @@ def naryVarNames (fixedPrefixSize : Nat) (preDef : PreDefinition) : TermElabM (A
 /-- Given
   - matcherApp `match_i As (fun xs => motive[xs]) discrs (fun ys_1 => (alt_1 : motive (C_1[ys_1])) ... (fun ys_n => (alt_n : motive (C_n[ys_n]) remaining`, and
   - expression `e : B[discrs]`,
-  returns the expressions `B[C_1[ys_1]])  ... B[C_n[ys_n]]`.
-  (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
+  returns the expressions `B[C_1[ys_1]])  ... B[C_n[ys_n]]`,
+  with `ys_i` as loose bound variables, ready to be `.instantiateRev`d; arity according to `matcherApp.altNumParams`.
   Cf. `MatcherApp.addArg`.
 -/
-def _root_.Lean.Meta.MatcherApp.transform {m}
-    -- TODO: Do we really need all these type classes?
-    -- I tried defining this in MetaM and use map2MetaM, but since the continuation is run
-    -- multiple times, this does not seem to work
-    [MonadControlT MetaM m] [MonadLiftT MetaM m] [Monad m] [MonadOptions m] [MonadTrace m]
-    [MonadLiftT IO m] [MonadError m] [AddMessageContext m]
-    (matcherApp : MatcherApp) (e : Expr) (k : Expr → Expr → m Unit) : m Unit :=
+def _root_.Lean.Meta.MatcherApp.transform (matcherApp : MatcherApp) (e : Expr) :
+    MetaM (Array Expr) :=
   lambdaTelescope matcherApp.motive fun motiveArgs _motiveBody => do
     trace[Elab.definition.wf] "MatcherApp.transform {indentExpr e}"
     unless motiveArgs.size == matcherApp.discrs.size do
@@ -117,19 +112,16 @@ def _root_.Lean.Meta.MatcherApp.transform {m}
     let auxType ← inferType aux
     let (altAuxs, _, _) ← Lean.Meta.forallMetaTelescope auxType
     let altAuxTys ← altAuxs.mapM (inferType ·)
-    (Array.zip matcherApp.alts altAuxTys).forM fun (alt, altAuxTy) => do
-    let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAuxTy
-    trace[Elab.definition.wf] "alt fvs: {fvs}"
-    let body := body.getArg! 2
-    -- and abstract over the parameters of the alternative again
-    let body ← Expr.abstractM body fvs
-    -- Go under the lambdas of the alt
-    lambdaTelescope alt fun xs altBody => do
-      unless fvs.size ≤ xs.size do
-        throwError "failed to transfer argument through matcher application, alternative does not have enough manifest lambdas"
-      let body := body.instantiateRev xs[:fvs.size]
-      trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
-      k body altBody
+    (Array.zip matcherApp.altNumParams altAuxTys).mapM fun (altNumParams, altAuxTy) => do
+      let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAuxTy
+      unless fvs.size = altNumParams do
+        throwError "failed to transfer argument through matcher application, alt type must be telescope with #{altNumParams} arguments"
+      -- extract type from our synthetic equality
+      let body := body.getArg! 2
+      -- and abstract over the parameters of the alternatives, so that we can safely pass the Expr out
+      Expr.abstractM body fvs
+
+
 
 /--
   Given a `casesOn` application `c` of the form
@@ -140,13 +132,10 @@ def _root_.Lean.Meta.MatcherApp.transform {m}
   ```
   B[C_i[ys_i]]
   ```
-  (with `ys_i` as loose bound variable, ready to be `.instantiate`d)
+  with `ys_i` as loose bound variables, ready to be `.instantiateRev`d; arity according to `CasesOnApp.altNumParams`.
 -/
-def _root_.Lean.Meta.CasesOnApp.transform {m}
-  -- TODO: Do we really need all these type classes?
-  [MonadControlT MetaM m] [MonadLiftT MetaM m] [Monad m] [MonadOptions m] [MonadTrace m]
-  [MonadLiftT IO m] [MonadError m] [AddMessageContext m]
-    (c : CasesOnApp) (e : Expr) (k : Expr → Expr → m Unit) : m Unit :=
+def _root_.Lean.Meta.CasesOnApp.transform (c : CasesOnApp) (e : Expr) :
+    MetaM (Array Expr) :=
   lambdaTelescope c.motive fun motiveArgs _motiveBody => do
     trace[Elab.definition.wf] "CasesOnApp.transform: {indentExpr e}"
     unless motiveArgs.size == c.indices.size + 1 do
@@ -171,19 +160,14 @@ def _root_.Lean.Meta.CasesOnApp.transform {m}
     -- so extract them
     let (altAuxs, _, _) ← Lean.Meta.forallMetaTelescope auxType
     let altAuxTys ← altAuxs.mapM (inferType ·)
-    (Array.zip c.alts altAuxTys).forM fun (alt, altAuxTy) => do
+    (Array.zip c.altNumParams altAuxTys).mapM fun (altNumParams, altAuxTy) => do
       let (fvs, _, body) ← Lean.Meta.forallMetaTelescope altAuxTy
-      trace[Elab.definition.wf] "alt fvs: {fvs}"
+      unless fvs.size = altNumParams do
+        throwError "failed to transfer argument through matcher application, alt type must be telescope with #{altNumParams} arguments"
+      -- extract type from our synthetic equality
       let body := body.getArg! 2
-      -- and abstract over the parameters of the alternative again
-      let body ← Expr.abstractM body fvs
-      -- Go under the lambdas of the alt
-      lambdaTelescope alt fun xs altBody => do
-        unless fvs.size ≤ xs.size do
-          throwError "failed to transfer argument through `casesOn` application, alternative does not have enough manifest lambdas"
-        let body := body.instantiateRev xs[:fvs.size]
-        trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr body}"
-        k body altBody
+      -- and abstract over the parameters of the alternatives, so that we can safely pass the Expr out
+      Expr.abstractM body fvs
 
 @[reducible]
 def M (recFnName : Name) (α β : Type) : Type :=
@@ -244,16 +228,30 @@ where
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          matcherApp.transform scrut fun scrut' altBody => do
-            loop scrut' altBody
+          let altScruts ← matcherApp.transform scrut
+          (Array.zip matcherApp.alts (Array.zip matcherApp.altNumParams altScruts)).forM
+            fun (alt, altNumParam, altScrut) =>
+              lambdaTelescope alt fun xs altBody => do
+                unless altNumParam ≤ xs.size do
+                  throwError "unexpected matcher application alternative{indentExpr alt}\nat application{indentExpr e}"
+                let altScrut := altScrut.instantiateRev xs[:altNumParam]
+                trace[Elab.definition.wf] "MatcherApp.transform result {indentExpr altScrut}"
+                loop altScrut altBody
       | none =>
       match (← toCasesOnApp? e) with
       | some casesOnApp =>
         if !Structural.recArgHasLooseBVarsAt recFnName fixedPrefixSize e then
           processApp scrut e
         else
-          casesOnApp.transform scrut fun scrut' altBody => do
-            loop scrut' altBody
+          let altScruts ← casesOnApp.transform scrut
+          (Array.zip casesOnApp.alts (Array.zip casesOnApp.altNumParams altScruts)).forM
+            fun (alt, altNumParam, altScrut) =>
+              lambdaTelescope alt fun xs altBody => do
+                unless altNumParam ≤ xs.size do
+                  throwError "unexpected `casesOn` application alternative{indentExpr alt}\nat application{indentExpr e}"
+                let altScrut := altScrut.instantiateRev xs[:altNumParam]
+                trace[Elab.definition.wf] "CasesOnApp.transform result {indentExpr altScrut}"
+                loop altScrut altBody
       | none => processApp scrut e
     | e => do
       let _ ← ensureNoRecFn recFnName e
