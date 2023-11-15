@@ -604,35 +604,40 @@ open Lean.Elab.WF.GuessLex
 def guessLex (preDefs : Array PreDefinition)  (unaryPreDef : PreDefinition)
     (fixedPrefixSize : Nat) (decrTactic? : Option Syntax) :
     TermElabM TerminationWF := do
-  let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
-  let arities := varNamess.map (·.size)
-  trace[Elab.definition.wf] "varNames is: {varNamess}"
+  try
+    let varNamess ← preDefs.mapM (naryVarNames fixedPrefixSize)
+    let arities := varNamess.map (·.size)
+    trace[Elab.definition.wf] "varNames is: {varNamess}"
 
-  -- Collect all recursive calls and extract their context
-  let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
-  let rcs ← recCalls.mapM (RecCallCache.mk decrTactic? ·)
-  let callMatrix := rcs.map (inspectCall ·)
+    -- Collect all recursive calls and extract their context
+    let recCalls ← collectRecCalls unaryPreDef fixedPrefixSize arities
+    let rcs ← recCalls.mapM (RecCallCache.mk decrTactic? ·)
+    let callMatrix := rcs.map (inspectCall ·)
 
-  let forbiddenArgs ← preDefs.mapM fun preDef =>
-    getForbiddenByTrivialSizeOf fixedPrefixSize preDef
+    let forbiddenArgs ← preDefs.mapM fun preDef =>
+      getForbiddenByTrivialSizeOf fixedPrefixSize preDef
 
-  -- Enumerate all meausures.
-  -- (With many functions with multiple arguments, this can explode a bit.
-  -- We could interleave enumerating measure with early pruning based on the recCalls,
-  -- once that becomes a problem. Until then, a use can always use an explicit
-  -- `terminating_by` annotatin.)
-  let some arg_measures := generateCombinations? forbiddenArgs arities
-    | throwError "Too many combinations"
+    -- Enumerate all meausures.
+    -- (With many functions with multiple arguments, this can explode a bit.
+    -- We could interleave enumerating measure with early pruning based on the recCalls,
+    -- once that becomes a problem. Until then, a use can always use an explicit
+    -- `terminating_by` annotatin.)
+    let some arg_measures := generateCombinations? forbiddenArgs arities
+      | throwError "Too many combinations"
 
-  -- The list of measures, including the measures that order functions.
-  -- The function ordering measures should come last
-  let measures : Array MutualMeasure :=
-    arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
+    -- The list of measures, including the measures that order functions.
+    -- The function ordering measures should come last
+    let measures : Array MutualMeasure :=
+      arg_measures.map .args ++ (List.range varNamess.size).toArray.map .func
 
-  match ← solve measures callMatrix with
-  | .some solution =>
-     buildTermWF (preDefs.map (·.declName)) varNamess solution
-  | .none =>
+    match ← solve measures callMatrix with
+    | .some solution => do
+      let wf ← buildTermWF (preDefs.map (·.declName)) varNamess solution
+      return wf
+    | .none => throwError "Cannot find a decreasing lexicographic order"
+  catch _ =>
+    -- Hide all errors from guessing lexicographic orderings, as before
+    -- TODO: surface unexpected errors, maybe surface detailed explanation like Isabelle
     throwError "failed to prove termination, use `termination_by` to specify a well-founded relation"
 
 
@@ -779,10 +784,3 @@ def eval_add (a : Expr × Expr) : Nat :=
   | (x, y) => eval x + eval y
 end
 derecursify_with withGuessLex
-
-def FinPlus1 n := Fin (n + 1)
-
-def badCasesOn (n : Nat) : Fin (n + 1) :=
-   Nat.casesOn (motive := FinPlus1) n (⟨0,Nat.zero_lt_succ _⟩) (fun n => Fin.succ (badCasesOn n))
-derecursify_with Lean.Elab.WF.withGuessLex
--- termination_by badCasesOn n => n
