@@ -5,7 +5,6 @@ set_option autoImplicit false
 set_option linter.unusedVariables false
 
 open Lean Meta Elab WF
-
 namespace Derec
 
 
@@ -17,16 +16,17 @@ private def applyDefaultDecrTactic (mvarId : MVarId) : TermElabM Unit := do
   remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
 
 private def mkDecreasingProof (decreasingProp : Expr) (decrTactic? : Option Syntax) : TermElabM Expr := do
-  let mvar ← mkFreshExprSyntheticOpaqueMVar decreasingProp
-  let mvarId := mvar.mvarId!
-  let mvarId ← mvarId.cleanup
-  match decrTactic? with
-  | none => applyDefaultDecrTactic mvarId
-  | some decrTactic =>
-    -- make info from `runTactic` available
-    pushInfoTree (.hole mvarId)
-    Term.runTactic mvarId decrTactic
-  instantiateMVars mvar
+  mkFreshExprSyntheticOpaqueMVar decreasingProp
+  -- let mvar ← mkFreshExprSyntheticOpaqueMVar decreasingProp
+  -- let mvarId := mvar.mvarId!
+  -- let mvarId ← mvarId.cleanup
+  -- match decrTactic? with
+  -- | none => applyDefaultDecrTactic mvarId
+  -- | some decrTactic =>
+  --   -- make info from `runTactic` available
+  --   pushInfoTree (.hole mvarId)
+  --   Term.runTactic mvarId decrTactic
+  -- instantiateMVars mvar
 
 private partial def replaceRecApps (recFnName : Name) (fixedPrefixSize : Nat) (decrTactic? : Option Syntax) (F : Expr) (e : Expr) : TermElabM Expr := do
   trace[Elab.definition.wf] "replaceRecApps:{indentExpr e}"
@@ -180,7 +180,14 @@ def mkFix (preDef : PreDefinition) (prefixArgs : Array Expr) (wfRel : Expr) (dec
       let val := preDef.value.beta (prefixArgs.push x)
       let val ← processSumCasesOn x F val fun x F val => do
         processPSigmaCasesOn x F val (replaceRecApps preDef.declName prefixArgs.size decrTactic?)
-      mkLambdaFVars prefixArgs (mkApp wfFix (← mkLambdaFVars #[x, F] val))
+      dbg_trace "{(← getMVars val).size}"
+      let val ← mkLambdaFVars #[x, F] val
+      dbg_trace "{(← getMVars val).size}"
+      let val := mkApp wfFix val
+      dbg_trace "{(← getMVars val).size}"
+      let val ← mkLambdaFVars prefixArgs val
+      dbg_trace "{(← getMVars val).size}"
+      return val
 
 
 -- Copied from src/lean/Lean/Elab/PreDefinition/WF/Main.lean
@@ -240,8 +247,22 @@ def wfRecursionSingleGoal (preDefs : Array PreDefinition) (wf? : Option Terminat
       /- `mkFix` invokes `decreasing_tactic` which may add auxiliary theorems to the environment. -/
       let value ← unfoldDeclsFrom envNew value
       return { unaryPreDef with value }
+
+  let goals ← getMVars preDefNonRec.value
+  let goals ← goals.mapM (·.cleanup)
+  let remainingGoals ← Tactic.run goals[0]! do
+    Tactic.setGoals goals.toList
+    match decrTactic? with
+    | none => Tactic.evalTactic (← `(tactic| decreasing_tactic))
+    | some decrTactic =>
+      -- make info from `runTactic` available
+      Tactic.evalTactic decrTactic[1]
+  Term.reportUnsolvedGoals remainingGoals
+  -- instantiateMVars mvar
+
   trace[Elab.definition.wf] ">> {preDefNonRec.declName} :=\n{preDefNonRec.value}"
   let preDefs ← preDefs.mapM fun d => eraseRecAppSyntax d
+
   if (← isOnlyOneUnaryDef preDefs fixedPrefixSize) then
     addNonRec preDefNonRec (applyAttrAfterCompilation := false)
   else
@@ -255,10 +276,15 @@ def wfRecursionSingleGoal (preDefs : Array PreDefinition) (wf? : Option Terminat
 
 def foo (n : Nat) : Nat :=
     foo (n - 1) + foo n + foo (n + 1)
--- derecursify_with (wfRecursionSingleGoal · none none)
+derecursify_with wfRecursionSingleGoal
 termination_by foo n => n
 decreasing_by
-  done
+  all_goals simp_wf
+
+
+
+
+#exit
 
 
 
