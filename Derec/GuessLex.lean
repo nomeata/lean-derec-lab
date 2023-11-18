@@ -605,17 +605,11 @@ partial def solve {m} {α} [Monad m] (measures : Array α)
     -- None found, we have to give up
     return .none
 
-
--- Does this really not yet exist? Should it?
--- Yes!
-partial def mkTupleSyntax : Array Syntax → MetaM Syntax
+-- TODO: Move to appropriate place
+def mkTupleSyntax : Array Term → MetaM Term
   | #[]  => `(())
   | #[e] => return e
-  | es   => do
-    let e : TSyntax `term := ⟨es[0]!⟩
-    let es : Syntax.TSepArray `term "," :=
-      ⟨(Syntax.SepArray.ofElems (sep := ",") es[1:]).1⟩
-    `(term|($e, $es,*))
+  | es   => `(($(es[0]!), $(es[1:]),*))
 
 def buildTermWF (declNames : Array Name) (varNamess : Array (Array Name))
     (measures : Array MutualMeasure) : MetaM TerminationWF := do
