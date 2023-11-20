@@ -13,20 +13,21 @@ open Meta
 private def applyDefaultDecrTactic (mvarId : MVarId) : TermElabM Unit := do
   let remainingGoals ← Tactic.run mvarId do
     Tactic.evalTactic (← `(tactic| decreasing_tactic))
+  -- TODO: Why not pass all goals to `reportUnsolvedGoals` when the array is non-empty?
   remainingGoals.forM fun mvarId => Term.reportUnsolvedGoals [mvarId]
 
 private def mkDecreasingProof (decreasingProp : Expr) (decrTactic? : Option Syntax) : TermElabM Expr := do
-  mkFreshExprSyntheticOpaqueMVar decreasingProp
-  -- let mvar ← mkFreshExprSyntheticOpaqueMVar decreasingProp
-  -- let mvarId := mvar.mvarId!
-  -- let mvarId ← mvarId.cleanup
-  -- match decrTactic? with
-  -- | none => applyDefaultDecrTactic mvarId
-  -- | some decrTactic =>
-  --   -- make info from `runTactic` available
-  --   pushInfoTree (.hole mvarId)
-  --   Term.runTactic mvarId decrTactic
-  -- instantiateMVars mvar
+  let mvar ← mkFreshExprSyntheticOpaqueMVar decreasingProp
+  let mvarId := mvar.mvarId!
+  let mvarId ← mvarId.cleanup
+  -- If we are using the default tactic, apply it here, so that errors
+  -- are reported at the call site
+  -- If we have an explicit tactic, just leave the MVar unassigned, we will feed them all
+  -- later
+  match decrTactic? with
+  | none => applyDefaultDecrTactic mvarId
+  | some _decrTactic => pure ()
+  return mvar
 
 private partial def replaceRecApps (recFnName : Name) (fixedPrefixSize : Nat) (decrTactic? : Option Syntax) (F : Expr) (e : Expr) : TermElabM Expr := do
   trace[Elab.definition.wf] "replaceRecApps:{indentExpr e}"
@@ -180,15 +181,8 @@ def mkFix (preDef : PreDefinition) (prefixArgs : Array Expr) (wfRel : Expr) (dec
       let val := preDef.value.beta (prefixArgs.push x)
       let val ← processSumCasesOn x F val fun x F val => do
         processPSigmaCasesOn x F val (replaceRecApps preDef.declName prefixArgs.size decrTactic?)
-      dbg_trace "{(← getMVars val).size}"
-      let val ← mkLambdaFVars #[x, F] val
-      dbg_trace "{(← getMVars val).size}"
-      let val := mkApp wfFix val
-      dbg_trace "{(← getMVars val).size}"
-      let val ← mkLambdaFVars prefixArgs val
-      dbg_trace "{(← getMVars val).size}"
+      let val ← mkLambdaFVars prefixArgs (mkApp wfFix (← mkLambdaFVars #[x, F] val))
       return val
-
 
 -- Copied from src/lean/Lean/Elab/PreDefinition/WF/Main.lean
 
@@ -248,17 +242,16 @@ def wfRecursionSingleGoal (preDefs : Array PreDefinition) (wf? : Option Terminat
       let value ← unfoldDeclsFrom envNew value
       return { unaryPreDef with value }
 
-  let goals ← getMVars preDefNonRec.value
-  let goals ← goals.mapM (·.cleanup)
-  let remainingGoals ← Tactic.run goals[0]! do
-    Tactic.setGoals goals.toList
-    match decrTactic? with
-    | none => Tactic.evalTactic (← `(tactic| decreasing_tactic))
-    | some decrTactic =>
-      -- make info from `runTactic` available
+  -- We are using interactive tactics, so run them on all remaining goals
+  if let some decrTactic := decrTactic? then
+    let goals ← getMVarsNoDelayed preDefNonRec.value
+    let remainingGoals ← Tactic.run goals[0]! do
+      Tactic.setGoals goals.toList
       Tactic.evalTactic decrTactic[1]
-  Term.reportUnsolvedGoals remainingGoals
-  -- instantiateMVars mvar
+    unless remainingGoals.isEmpty do
+      Term.reportUnsolvedGoals remainingGoals
+
+  let preDefNonRec := { preDefNonRec with value := ← instantiateMVars preDefNonRec.value }
 
   trace[Elab.definition.wf] ">> {preDefNonRec.declName} :=\n{preDefNonRec.value}"
   let preDefs ← preDefs.mapM fun d => eraseRecAppSyntax d
@@ -279,14 +272,14 @@ def foo (n : Nat) : Nat :=
 derecursify_with wfRecursionSingleGoal
 termination_by foo n => n
 decreasing_by
-  all_goals simp_wf
+  · sorry
+  · sorry
+  · sorry
 
-
-
-
-#exit
-
-
+def foo3 (n : Nat) : Nat :=
+    foo3 (n - 1) + foo3 n + foo3 (n + 1)
+derecursify_with wfRecursionSingleGoal
+termination_by foo3 n => n
 
 def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
   | .succ n, 1 => foo2 n 1
@@ -299,4 +292,4 @@ def foo2 (n : Nat) (m : Nat) : Nat := match n, m with
 derecursify_with wfRecursionSingleGoal
 termination_by foo2 n m => (m, n)
 decreasing_by
-  done
+  all_goals decreasing_tactic
